@@ -145,20 +145,51 @@ func handleMessage(manager map[string]interface{}, msg Message) {
 			}
 			return
 		}
-		if grid[x][y]["nearest_fire"].(bool) {
-			if msg["reply"] != nil {
-				x, y, fire := findNearestFire(manager)
-				msg["reply"].(chan Message) <- Message{"ok": false, "info": fmt.Sprintf("%d, %d, %t", x, y, fire)}
 
-			}
-			return
-		}
 		// Place truck on grid
 		grid[x][y]["truck"] = id
 
 		if msg["reply"] != nil {
 			msg["reply"].(chan Message) <- Message{"ok": true, "info": "registered"}
 		}
+		return
+
+	case "nearest_fire":
+		sx, sy := msg["x"].(int), msg["y"].(int)
+		nx, ny, ok := nearestFireFrom(grid, sx, sy)
+		if msg["reply"] != nil {
+			msg["reply"].(chan Message) <- Message{
+				"ok":   ok,
+				"x":    nx,
+				"y":    ny,
+				"info": "nearest_fire",
+			}
+		}
+		return
+
+	case "move":
+		id := msg["from"].(string)
+		sx, sy := msg["x"].(int), msg["y"].(int)
+		nx, ny := msg["nx"].(int), msg["ny"].(int)
+
+		if !inBounds(size, nx, ny) {
+			msg["reply"].(chan Message) <- Message{"ok": false, "info": "out of bounds"}
+			return
+		}
+
+		if grid[sx][sy]["truck"].(string) != id {
+			msg["reply"].(chan Message) <- Message{"ok": false, "info": "not at source"}
+			return
+		}
+		if grid[nx][ny]["truck"].(string) != "" {
+			msg["reply"].(chan Message) <- Message{"ok": false, "info": "blocked"}
+			return
+		}
+
+		grid[sx][sy]["truck"] = ""
+		grid[nx][ny]["truck"] = id
+
+		msg["reply"].(chan Message) <- Message{"ok": true, "x": nx, "y": ny, "info": "moved"}
 		return
 	// TODO to complete Task 0: implementation of other messages for the following actions:
 	// - truck requests position of the closes fire
@@ -171,48 +202,51 @@ func handleMessage(manager map[string]interface{}, msg Message) {
 
 }
 
-func findNearestFire(manager map[string]interface{}) (int, int, bool) {
-	grid := manager["grid"].([][]map[string]interface{})
+func nearestFireFrom(grid [][]map[string]interface{}, sx, sy int) (int, int, bool) {
 	size := len(grid)
-	visited := make([][]bool, size)
-	for i := range visited {
-		visited[i] = make([]bool, size)
-	}
+	bestX, bestY := -1, -1
+	bestDist := int(^uint(0) >> 1)
+	found := false
 
-	type Node struct {
-		x, y int
-	}
-
-	directions := [][]int{
-		{0, 1},
-		{0, -1},
-		{1, 0},
-		{-1, 0},
-	}
-
-	queue := []Node{{manager["x"].(int), manager["y"].(int)}}
-	visited[manager["x"].(int)][manager["y"].(int)] = true
-
-	for len(queue) > 0 {
-		current := queue[0]
-		queue = queue[1:]
-
-		cell := grid[current.x][current.y]
-		if cell["fire"].(bool) {
-			return current.x, current.y, true
-		}
-
-		for _, d := range directions {
-			nx, ny := current.x+d[0], current.y+d[1]
-			if nx >= 0 && nx < size && ny >= 0 && ny < size && !visited[nx][ny] {
-				visited[nx][ny] = true
-				queue = append(queue, Node{nx, ny})
+	for i := 0; i < size; i++ {
+		for j := 0; j < size; j++ {
+			if grid[i][j]["fire"].(bool) {
+				d := abs(i-sx) + abs(j-sy)
+				if d < bestDist {
+					bestDist = d
+					bestX, bestY = i, j
+					found = true
+				}
 			}
 		}
 	}
+	return bestX, bestY, found
+}
 
-	return -1, -1, false
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
 
+func stepToward(sx, sy, tx, ty int) (nx, ny int) {
+	nx, ny = sx, sy
+	dx, dy := tx-sx, ty-sy
+	if abs(dx) >= abs(dy) {
+		if dx > 0 {
+			nx++
+		} else if dx < 0 {
+			nx--
+		}
+	} else {
+		if dy > 0 {
+			ny++
+		} else if dy < 0 {
+			ny--
+		}
+	}
+	return
 }
 
 // ------------------- Manager helper functions -------------------
@@ -330,18 +364,68 @@ func registerTruck(truck map[string]interface{}) {
 func truckLoop(truck map[string]interface{}) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
-	for {
-		// TODO for Task 0: add functionality:
-		// - request nearest fire
-		handleMessage(truck, Message{"type": "nearest_fire", "from": truck["id"], "x": truck["x"], "y": truck["y"], "reply": truck["reply"]})
+	for range ticker.C {
 
-		// - decide movement direction
-		// - send move request
-		// - send water request
-		// - communicate
-		// - extinguish fire
+		// Ask manager for nearest fire from our current position
+
+		req := Message{
+			"type":  "nearest_fire",
+			"from":  truck["id"],
+			"x":     truck["x"],
+			"y":     truck["y"],
+			"reply": truck["reply"],
+		}
+		truck["mgr"].(chan Message) <- req
+
+		resp := <-truck["reply"].(chan Message)
+
+		if !resp["ok"].(bool) {
+			fmt.Printf("[Truck %s] No fires found.\n", truck["id"])
+			continue
+
+			// (For later steps you’ll move toward (nx,ny), request water, etc.)
+			// Keep it simple for now since we're only doing "find nearest".
+		}
+
+		targetX := resp["x"].(int)
+		targetY := resp["y"].(int)
+
+		curX := truck["x"].(int)
+		curY := truck["y"].(int)
+		if curX == targetX && curY == targetY {
+			fmt.Printf("[Truck %s] On fire cell (%d, %d). (Extinguish comes next.)\n", truck["id"], curX, curY)
+			continue
+		}
+		nx, ny := stepToward(curX, curY, targetX, targetY)
+
+		moveReq := Message{
+			"type":  "move",
+			"from":  truck["id"],
+			"x":     curX,
+			"y":     curY,
+			"nx":    nx,
+			"ny":    ny,
+			"reply": truck["reply"],
+		}
+		truck["mgr"].(chan Message) <- moveReq
+		moveResp := <-truck["reply"].(chan Message)
+
+		if moveResp["ok"].(bool) {
+			truck["x"] = moveResp["x"].(int)
+			truck["y"] = moveResp["y"].(int)
+			fmt.Printf("[Truck %s] Moved to (%d,%d)\n", truck["id"], truck["x"], truck["y"])
+		} else {
+			fmt.Printf("[Truck %s] Move failed: %v\n", truck["id"], moveResp["info"])
+		}
 	}
 }
+
+// TODO for Task 0: add functionality:
+// - decide movement direction
+// - send move request
+// - send water request
+// - communicate
+// - extinguish fire
 
 // ----------------------- Main -----------------------
 func main() {

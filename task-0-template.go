@@ -191,6 +191,58 @@ func handleMessage(manager map[string]interface{}, msg Message) {
 
 		msg["reply"].(chan Message) <- Message{"ok": true, "x": nx, "y": ny, "info": "moved"}
 		return
+
+	case "extinguish":
+		id := msg["from"].(string)
+		x, y := msg["x"].(int), msg["y"].(int)
+
+		if !inBounds(size, x, y) || grid[x][y]["truck"].(string) != id {
+			msg["reply"].(chan Message) <- Message{"ok": false, "info": "not at location"}
+			return
+		}
+
+		if !grid[x][y]["fire"].(bool) {
+			msg["reply"].(chan Message) <- Message{"ok": false, "info": "no fire"}
+			return
+		}
+
+		intensity := grid[x][y]["intensity"].(int)
+		if intensity <= 0 {
+			grid[x][y]["fire"] = false
+			grid[x][y]["intensity"] = 0
+			msg["reply"].(chan Message) <- Message{"ok": true, "info": "already out", "intensity": 0}
+			return
+		}
+
+		remove := 3
+		if intensity < remove {
+			remove = intensity
+		}
+		avail := manager["water"].(int)
+		if avail < remove {
+			remove = avail
+		}
+		if remove == 0 {
+			msg["reply"].(chan Message) <- Message{"ok": false, "info": "no water"}
+			return
+		}
+
+		manager["water"] = avail - remove
+		intensity -= remove
+		if intensity <= 0 {
+			grid[x][y]["fire"] = false
+			intensity = 0
+		}
+
+		grid[x][y]["intensity"] = intensity
+
+		msg["reply"].(chan Message) <- Message{
+			"ok":        true,
+			"info":      "extinguished_step",
+			"intensity": intensity,
+		}
+		return
+
 	// TODO to complete Task 0: implementation of other messages for the following actions:
 	// - truck requests position of the closes fire
 	// - truck moves around the grid (n, s, e, w)
@@ -339,11 +391,13 @@ func display(manager map[string]interface{}) {
 // Create a firetruck - note: this creates a local truck but does not register it to the grid
 func createTruck(id string, x, y int, inbox chan Message) map[string]interface{} {
 	return map[string]interface{}{
-		"id":    id,
-		"x":     x,
-		"y":     y,
-		"mgr":   inbox,
-		"reply": make(chan Message, 1),
+		"id":       id,
+		"x":        x,
+		"y":        y,
+		"mgr":      inbox,
+		"reply":    make(chan Message, 1),
+		"water":    5,  // start with some water
+		"maxWater": 10, // truck capacity (small for demo)
 	}
 }
 
@@ -393,7 +447,22 @@ func truckLoop(truck map[string]interface{}) {
 		curX := truck["x"].(int)
 		curY := truck["y"].(int)
 		if curX == targetX && curY == targetY {
-			fmt.Printf("[Truck %s] On fire cell (%d, %d). (Extinguish comes next.)\n", truck["id"], curX, curY)
+			extReq := Message{
+				"type":  "extinguish",
+				"from":  truck["id"],
+				"x":     curX,
+				"y":     curY,
+				"reply": truck["reply"],
+			}
+			truck["mgr"].(chan Message) <- extReq
+			extResp := <-truck["reply"].(chan Message)
+
+			if extResp["ok"].(bool) {
+				fmt.Printf("[Truck %s] Extinguishing at (%d,%d). Intensity now: %v\n",
+					truck["id"], curX, curY, extResp["intensity"])
+			} else {
+				fmt.Printf("[Truck %s] Extinguish failed: %v\n", truck["id"], extResp["info"])
+			}
 			continue
 		}
 		nx, ny := stepToward(curX, curY, targetX, targetY)

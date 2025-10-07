@@ -22,14 +22,13 @@ Currently implemented features:
 - 20x20 grid with fires and trucks
 - Fires can randomly ignite and spread/intensify
 - Firetrucks can be created and registered on the grid
-  (extend to include the rest of the firetruck functinoalities)
+  (extend to include the rest of the firetruck functionalities)
 - Central manager for handling messages
   (this should be changed later when implementing distributed communication)
 ====================================================================================
 */
 
 // New type "Message" for truck-manager communication
-type Message map[string]interface{}
 
 // ----------------------- Central manager -----------------------
 // Create manager
@@ -76,7 +75,7 @@ func runManager(manager map[string]interface{}, stopAfter int, tick time.Duratio
 
 		// Random new fire
 		if rng.Float32() < 0.5 {
-			addFire(manager, rand.Intn(size), rand.Intn(size))
+			addFire(manager, rng.Intn(size), rng.Intn(size))
 		}
 
 		// Refill global water supply so that it doesn't just run out
@@ -119,103 +118,90 @@ func drainMessages(manager map[string]interface{}) {
 	}
 }
 
-// Handle messages (placeholder)
+// Handle messages
 func handleMessage(manager map[string]interface{}, msg Message) {
 	grid := manager["grid"].([][]map[string]interface{})
 	size := len(grid)
-	switch msg["type"] {
-	case "register":
-		/*
-			This example implementation has a central-manager approach.
-			For Task 1, you will replace the synchronous channel-based
-			truck registration with a network handshake (TCP/NATS).
-		*/
-		// Truck requests to register at position (x, y) on the grid
-		x, y := msg["x"].(int), msg["y"].(int)
-		id := msg["from"].(string)
 
-		// Validate grid bounds and cell occupancy
+	switch msg.Type {
+
+	case "register":
+		x, y := *msg.X, *msg.Y
+		id := msg.From
+
 		if !inBounds(size, x, y) {
-			if msg["reply"] != nil {
-				msg["reply"].(chan Message) <- Message{"ok": false, "info": "out of bounds"}
+			if msg.Reply != nil {
+				msg.Reply <- Message{OK: pbool(false), Info: "out of bounds"}
 			}
 			return
 		}
 		if grid[x][y]["truck"].(string) != "" {
-			if msg["reply"] != nil {
-				msg["reply"].(chan Message) <- Message{"ok": false, "info": "cell occupied"}
+			if msg.Reply != nil {
+				msg.Reply <- Message{OK: pbool(false), Info: "cell occupied"}
 			}
 			return
 		}
 
-		// Place truck on grid
 		grid[x][y]["truck"] = id
-
-		if msg["reply"] != nil {
-			msg["reply"].(chan Message) <- Message{"ok": true, "info": "registered"}
+		if msg.Reply != nil {
+			msg.Reply <- Message{OK: pbool(true), Info: "registered"}
 		}
 		return
 
 	case "nearest_fire":
-		sx, sy := msg["x"].(int), msg["y"].(int)
+		sx, sy := *msg.X, *msg.Y
 		nx, ny, ok := nearestFireFrom(grid, sx, sy)
-		if msg["reply"] != nil {
-			msg["reply"].(chan Message) <- Message{
-				"ok":   ok,
-				"x":    nx,
-				"y":    ny,
-				"info": "nearest_fire",
+		if msg.Reply != nil {
+			if ok {
+				msg.Reply <- Message{Type: "nearest_fire", OK: pbool(true), X: pint(nx), Y: pint(ny), Info: "nearest_fire"}
+			} else {
+				msg.Reply <- Message{Type: "nearest_fire", OK: pbool(false), Info: "no fire"}
 			}
 		}
 		return
 
 	case "move":
-		id := msg["from"].(string)
-		sx, sy := msg["x"].(int), msg["y"].(int)
-		nx, ny := msg["nx"].(int), msg["ny"].(int)
+		id := msg.From
+		sx, sy := *msg.X, *msg.Y
+		nx, ny := *msg.NX, *msg.NY
 
 		if !inBounds(size, nx, ny) {
-			msg["reply"].(chan Message) <- Message{"ok": false, "info": "out of bounds"}
+			msg.Reply <- Message{OK: pbool(false), Info: "out of bounds"}
 			return
 		}
-
 		if grid[sx][sy]["truck"].(string) != id {
-			msg["reply"].(chan Message) <- Message{"ok": false, "info": "not at source"}
+			msg.Reply <- Message{OK: pbool(false), Info: "not at source"}
 			return
 		}
 		if grid[nx][ny]["truck"].(string) != "" {
-			msg["reply"].(chan Message) <- Message{"ok": false, "info": "blocked"}
+			msg.Reply <- Message{OK: pbool(false), Info: "blocked"}
 			return
 		}
 
 		grid[sx][sy]["truck"] = ""
 		grid[nx][ny]["truck"] = id
-
-		msg["reply"].(chan Message) <- Message{"ok": true, "x": nx, "y": ny, "info": "moved"}
+		msg.Reply <- Message{OK: pbool(true), X: pint(nx), Y: pint(ny), Info: "moved"}
 		return
 
 	case "extinguish":
-		id := msg["from"].(string)
-		x, y := msg["x"].(int), msg["y"].(int)
-		truckWater := msg["truckWater"].(int)
+		id := msg.From
+		x, y := *msg.X, *msg.Y
+		truckWater := *msg.TruckWater
 
 		if !inBounds(size, x, y) || grid[x][y]["truck"].(string) != id {
-			msg["reply"].(chan Message) <- Message{"ok": false, "info": "not at location"}
+			msg.Reply <- Message{OK: pbool(false), Info: "not at location"}
 			return
 		}
-
 		if !grid[x][y]["fire"].(bool) {
-			msg["reply"].(chan Message) <- Message{"ok": false, "info": "no fire"}
+			msg.Reply <- Message{OK: pbool(false), Info: "no fire"}
 			return
 		}
-
 		if truckWater <= 0 {
-			msg["reply"].(chan Message) <- Message{"ok": false, "info": "no truck water"}
+			msg.Reply <- Message{OK: pbool(false), Info: "no truck water"}
 			return
 		}
 
 		intensity := grid[x][y]["intensity"].(int)
-
 		remove := 3
 		if remove > intensity {
 			remove = intensity
@@ -224,57 +210,43 @@ func handleMessage(manager map[string]interface{}, msg Message) {
 			remove = truckWater
 		}
 		intensity -= remove
-
 		if intensity <= 0 {
 			grid[x][y]["fire"] = false
 			intensity = 0
 		}
-
 		grid[x][y]["intensity"] = intensity
 
-		msg["reply"].(chan Message) <- Message{
-			"ok":        true,
-			"spent":     remove,
-			"intensity": intensity,
-		}
+		msg.Reply <- Message{OK: pbool(true), Spent: pint(remove), Intensity: pint(intensity)}
 		return
 
 	case "refill_truck":
-		id := msg["from"].(string)
-		x, y := msg["x"].(int), msg["y"].(int)
-		need := msg["need"].(int)
+		id := msg.From
+		x, y := *msg.X, *msg.Y
+		need := *msg.Need
 
 		if !inBounds(size, x, y) || grid[x][y]["truck"].(string) != id {
-			msg["reply"].(chan Message) <- Message{"ok": false, "info": "not at location"}
-
+			msg.Reply <- Message{OK: pbool(false), Info: "not at location"}
 			return
 		}
 
 		avail := manager["water"].(int)
-
 		if avail <= 0 || need <= 0 {
-			msg["reply"].(chan Message) <- Message{"ok": false, "info": "no global water"}
+			msg.Reply <- Message{OK: pbool(false), Info: "no global water"}
 			return
 		}
-
 		if need > avail {
 			need = avail
 		}
 		manager["water"] = avail - need
 
-		// Tell truck how much it actually got
-		msg["reply"].(chan Message) <- Message{"ok": true, "granted": need}
+		msg.Reply <- Message{OK: pbool(true), Granted: pint(need)}
 		return
 
-	// TODO to complete Task 0: implementation of other messages for the following actions:
-	// - truck requests position of the closes fire
-	// - truck moves around the grid (n, s, e, w)
-	// - truck requests water
-	// - truck extinguishes fire
 	default:
-		msg["reply"].(chan Message) <- Message{"ok": false}
+		if msg.Reply != nil {
+			msg.Reply <- Message{OK: pbool(false), Info: "unknown"}
+		}
 	}
-
 }
 
 func nearestFireFrom(grid [][]map[string]interface{}, sx, sy int) (int, int, bool) {
@@ -336,7 +308,7 @@ func addFire(manager map[string]interface{}, x, y int) {
 	grid := manager["grid"].([][]map[string]interface{})
 	if !grid[x][y]["fire"].(bool) {
 		grid[x][y]["fire"] = true
-		grid[x][y]["intensity"] = rand.Intn(3) + 1
+		grid[x][y]["intensity"] = rng.Intn(3) + 1
 	}
 }
 
@@ -412,174 +384,169 @@ func display(manager map[string]interface{}) {
 // Add/modify/expand as needed
 
 // Create a firetruck - note: this creates a local truck but does not register it to the grid
-func createTruck(id string, x, y int, inbox chan Message) map[string]interface{} {
+// Create a firetruck – now it opens a TCP connection to the manager
+func createTruck(id string, x, y int) map[string]interface{} {
+	tc, err := dialManager(":9000") // TCP client
+	if err != nil {
+		panic(err)
+	}
 	return map[string]interface{}{
 		"id":       id,
 		"x":        x,
 		"y":        y,
-		"mgr":      inbox,
-		"reply":    make(chan Message, 1),
-		"water":    5,  // start with some water
-		"maxWater": 10, // truck capacity (small for demo)
+		"conn":     tc, // <— store TCP handle
+		"water":    5,
+		"maxWater": 10,
 	}
 }
 
 // Register a firetruck to the grid via the manager
 func registerTruck(truck map[string]interface{}) {
+	tc := truck["conn"].(*TruckConn)
 	msg := Message{
-		"type":  "register",
-		"from":  truck["id"],
-		"x":     truck["x"],
-		"y":     truck["y"],
-		"reply": truck["reply"],
+		Type: "register",
+		From: truck["id"].(string),
+		X:    pint(truck["x"].(int)),
+		Y:    pint(truck["y"].(int)),
 	}
-	truck["mgr"].(chan Message) <- msg
-	<-truck["reply"].(chan Message)
+	_, err := tc.req(msg)
+	if err != nil {
+		panic(err)
+	}
 }
 
 // Skeleton of firetruck actions
 func truckLoop(truck map[string]interface{}) {
+	tc := truck["conn"].(*TruckConn)
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
+
 	for range ticker.C {
-
-		// Ask manager for nearest fire from our current position
-
-		req := Message{
-			"type":  "nearest_fire",
-			"from":  truck["id"],
-			"x":     truck["x"],
-			"y":     truck["y"],
-			"reply": truck["reply"],
+		// 1) Ask nearest fire
+		resp, err := tc.req(Message{
+			Type: "nearest_fire",
+			From: truck["id"].(string),
+			X:    pint(truck["x"].(int)),
+			Y:    pint(truck["y"].(int)),
+		})
+		if err != nil {
+			fmt.Printf("[Truck %s] nearest_fire error: %v\n", truck["id"], err)
+			continue
 		}
-		truck["mgr"].(chan Message) <- req
-
-		resp := <-truck["reply"].(chan Message)
-
-		if !resp["ok"].(bool) {
+		if resp.OK != nil && !*resp.OK {
 			fmt.Printf("[Truck %s] No fires found.\n", truck["id"])
 			continue
-
-			// (For later steps you’ll move toward (nx,ny), request water, etc.)
-			// Keep it simple for now since we're only doing "find nearest".
 		}
 
-		targetX := resp["x"].(int)
-		targetY := resp["y"].(int)
+		targetX := *resp.X
+		targetY := *resp.Y
 
 		curX := truck["x"].(int)
 		curY := truck["y"].(int)
+
+		// 2) If on fire, refill/ extinguish
 		if curX == targetX && curY == targetY {
-			// Ensure we have water
 			w := truck["water"].(int)
 			if w == 0 {
-				// Ask manager to refill some amount (aim for full)
 				want := truck["maxWater"].(int)
-				refillReq := Message{
-					"type":  "refill_truck",
-					"from":  truck["id"],
-					"x":     curX,
-					"y":     curY,
-					"need":  want - w,
-					"reply": truck["reply"],
+				refillResp, err := tc.req(Message{
+					Type: "refill_truck",
+					From: truck["id"].(string),
+					X:    pint(curX),
+					Y:    pint(curY),
+					Need: pint(want - w),
+				})
+				if err != nil {
+					fmt.Printf("[Truck %s] refill error: %v\n", truck["id"], err)
+					continue
 				}
-				truck["mgr"].(chan Message) <- refillReq
-				refillResp := <-truck["reply"].(chan Message)
-				if refillResp["ok"].(bool) {
-					granted := refillResp["granted"].(int)
+				if refillResp.OK != nil && *refillResp.OK {
+					granted := *refillResp.Granted
 					maxW := truck["maxWater"].(int)
 					cur := truck["water"].(int)
 					newW := cur + granted
 					if newW > maxW {
 						newW = maxW
-					} // clamp
+					}
 					truck["water"] = newW
 					fmt.Printf("[Truck %s] Refilled %d units. Tank: %d/%d\n",
 						truck["id"], newW-cur, truck["water"], maxW)
 				} else {
-					fmt.Printf("[Truck %s] Refill failed: %v\n", truck["id"], refillResp["info"])
+					fmt.Printf("[Truck %s] Refill failed: %v\n", truck["id"], refillResp.Info)
 				}
-				// Next tick we’ll try extinguish again
 				continue
 			}
-			extReq := Message{
-				"type":       "extinguish",
-				"from":       truck["id"],
-				"x":          curX,
-				"y":          curY,
-				"truckWater": w,
-				"reply":      truck["reply"]}
 
-			truck["mgr"].(chan Message) <- extReq
-			extResp := <-truck["reply"].(chan Message)
-
-			if extResp["ok"].(bool) {
-				spent := extResp["spent"].(int)               // <--
-				truck["water"] = truck["water"].(int) - spent // <--
+			extResp, err := tc.req(Message{
+				Type:       "extinguish",
+				From:       truck["id"].(string),
+				X:          pint(curX),
+				Y:          pint(curY),
+				TruckWater: pint(w),
+			})
+			if err != nil {
+				fmt.Printf("[Truck %s] extinguish error: %v\n", truck["id"], err)
+				continue
+			}
+			if extResp.OK != nil && *extResp.OK {
+				spent := *extResp.Spent
+				truck["water"] = truck["water"].(int) - spent
 				fmt.Printf("[Truck %s] Extinguishing at (%d,%d). Intensity now: %v\n",
-					truck["id"], curX, curY, extResp["intensity"])
+					truck["id"], curX, curY, *extResp.Intensity)
 			} else {
-				fmt.Printf("[Truck %s] Extinguish failed: %v\n", truck["id"], extResp["info"])
+				fmt.Printf("[Truck %s] Extinguish failed: %v\n", truck["id"], extResp.Info)
 			}
 			continue
 		}
+
+		// 3) Move one step toward target
 		nx, ny := stepToward(curX, curY, targetX, targetY)
-
-		moveReq := Message{
-			"type":  "move",
-			"from":  truck["id"],
-			"x":     curX,
-			"y":     curY,
-			"nx":    nx,
-			"ny":    ny,
-			"reply": truck["reply"],
+		moveResp, err := tc.req(Message{
+			Type: "move",
+			From: truck["id"].(string),
+			X:    pint(curX),
+			Y:    pint(curY),
+			NX:   pint(nx),
+			NY:   pint(ny),
+		})
+		if err != nil {
+			fmt.Printf("[Truck %s] move error: %v\n", truck["id"], err)
+			continue
 		}
-		truck["mgr"].(chan Message) <- moveReq
-		moveResp := <-truck["reply"].(chan Message)
-
-		if moveResp["ok"].(bool) {
-			truck["x"] = moveResp["x"].(int)
-			truck["y"] = moveResp["y"].(int)
+		if moveResp.OK != nil && *moveResp.OK {
+			truck["x"] = *moveResp.X
+			truck["y"] = *moveResp.Y
 			fmt.Printf("[Truck %s] Moved to (%d,%d)\n", truck["id"], truck["x"], truck["y"])
 		} else {
-			fmt.Printf("[Truck %s] Move failed: %v\n", truck["id"], moveResp["info"])
+			fmt.Printf("[Truck %s] Move failed: %v\n", truck["id"], moveResp.Info)
 		}
 	}
 }
 
 // TODO for Task 0: add functionality:
-// - decide movement direction
-// - send move request
-// - send water request
-// - communicate
-// - extinguish fire
+// - decide movement direction DONE
+// - send move request DONE
+// - send water request DONE
+// - communicate DONE
+// - extinguish fire DONE
 
 // ----------------------- Main -----------------------
 func main() {
-
-	// Create the central manager (with arbitrary example values)
-	manager := createManager(20, 500, 20)
-
-	// Create the 'done' channel to signal when the simulation is over
+	manager := createManager(20, 500, 1)
+	go runManagerTCP(manager) // start TCP server
 	done := make(chan struct{})
+	go runManager(manager, 50, 2*time.Second, done) // tick/spread/display
 
-	// Run the manager for 50 timesteps with 2 seconds per timestep
-	go runManager(manager, 50, 2*time.Second, done)
+	// ... fires ...
 
-	// Create two initial fires at random grid positions (example)
-	addFire(manager, rng.Intn(20), rng.Intn(20))
-	addFire(manager, rng.Intn(20), rng.Intn(20))
-
-	// Create, register, and run 2 firetrucks at random grid positions (example)
-	truck1 := createTruck("T1", rng.Intn(20), rng.Intn(20), manager["inbox"].(chan Message))
-	truck2 := createTruck("T2", rng.Intn(20), rng.Intn(20), manager["inbox"].(chan Message))
+	truck1 := createTruck("T1", rng.Intn(20), rng.Intn(20)) // these call dialManager (with retry)
+	truck2 := createTruck("T2", rng.Intn(20), rng.Intn(20))
 
 	registerTruck(truck1)
 	registerTruck(truck2)
-	fmt.Println(manager)
 	go truckLoop(truck1)
 	go truckLoop(truck2)
 
-	// Finish simulation once the manager signals completion
 	<-done
+
 }

@@ -6,6 +6,8 @@ import (
 	"time"
 )
 
+var rng = rand.New(rand.NewSource(time.Now().UnixNano()))
+
 /*
 ================================= Task 0 Template =================================
 This is a very basic, minimal template that aims to provide a starting point for
@@ -73,7 +75,7 @@ func runManager(manager map[string]interface{}, stopAfter int, tick time.Duratio
 		}
 
 		// Random new fire
-		if rand.Float32() < 0.5 {
+		if rng.Float32() < 0.5 {
 			addFire(manager, rand.Intn(size), rand.Intn(size))
 		}
 
@@ -195,6 +197,7 @@ func handleMessage(manager map[string]interface{}, msg Message) {
 	case "extinguish":
 		id := msg["from"].(string)
 		x, y := msg["x"].(int), msg["y"].(int)
+		truckWater := msg["truckWater"].(int)
 
 		if !inBounds(size, x, y) || grid[x][y]["truck"].(string) != id {
 			msg["reply"].(chan Message) <- Message{"ok": false, "info": "not at location"}
@@ -206,29 +209,22 @@ func handleMessage(manager map[string]interface{}, msg Message) {
 			return
 		}
 
-		intensity := grid[x][y]["intensity"].(int)
-		if intensity <= 0 {
-			grid[x][y]["fire"] = false
-			grid[x][y]["intensity"] = 0
-			msg["reply"].(chan Message) <- Message{"ok": true, "info": "already out", "intensity": 0}
+		if truckWater <= 0 {
+			msg["reply"].(chan Message) <- Message{"ok": false, "info": "no truck water"}
 			return
 		}
+
+		intensity := grid[x][y]["intensity"].(int)
 
 		remove := 3
-		if intensity < remove {
+		if remove > intensity {
 			remove = intensity
 		}
-		avail := manager["water"].(int)
-		if avail < remove {
-			remove = avail
+		if remove > truckWater {
+			remove = truckWater
 		}
-		if remove == 0 {
-			msg["reply"].(chan Message) <- Message{"ok": false, "info": "no water"}
-			return
-		}
-
-		manager["water"] = avail - remove
 		intensity -= remove
+
 		if intensity <= 0 {
 			grid[x][y]["fire"] = false
 			intensity = 0
@@ -238,9 +234,36 @@ func handleMessage(manager map[string]interface{}, msg Message) {
 
 		msg["reply"].(chan Message) <- Message{
 			"ok":        true,
-			"info":      "extinguished_step",
+			"spent":     remove,
 			"intensity": intensity,
 		}
+		return
+
+	case "refill_truck":
+		id := msg["from"].(string)
+		x, y := msg["x"].(int), msg["y"].(int)
+		need := msg["need"].(int)
+
+		if !inBounds(size, x, y) || grid[x][y]["truck"].(string) != id {
+			msg["reply"].(chan Message) <- Message{"ok": false, "info": "not at location"}
+
+			return
+		}
+
+		avail := manager["water"].(int)
+
+		if avail <= 0 || need <= 0 {
+			msg["reply"].(chan Message) <- Message{"ok": false, "info": "no global water"}
+			return
+		}
+
+		if need > avail {
+			need = avail
+		}
+		manager["water"] = avail - need
+
+		// Tell truck how much it actually got
+		msg["reply"].(chan Message) <- Message{"ok": true, "granted": need}
 		return
 
 	// TODO to complete Task 0: implementation of other messages for the following actions:
@@ -447,17 +470,52 @@ func truckLoop(truck map[string]interface{}) {
 		curX := truck["x"].(int)
 		curY := truck["y"].(int)
 		if curX == targetX && curY == targetY {
-			extReq := Message{
-				"type":  "extinguish",
-				"from":  truck["id"],
-				"x":     curX,
-				"y":     curY,
-				"reply": truck["reply"],
+			// Ensure we have water
+			w := truck["water"].(int)
+			if w == 0 {
+				// Ask manager to refill some amount (aim for full)
+				want := truck["maxWater"].(int)
+				refillReq := Message{
+					"type":  "refill_truck",
+					"from":  truck["id"],
+					"x":     curX,
+					"y":     curY,
+					"need":  want - w,
+					"reply": truck["reply"],
+				}
+				truck["mgr"].(chan Message) <- refillReq
+				refillResp := <-truck["reply"].(chan Message)
+				if refillResp["ok"].(bool) {
+					granted := refillResp["granted"].(int)
+					maxW := truck["maxWater"].(int)
+					cur := truck["water"].(int)
+					newW := cur + granted
+					if newW > maxW {
+						newW = maxW
+					} // clamp
+					truck["water"] = newW
+					fmt.Printf("[Truck %s] Refilled %d units. Tank: %d/%d\n",
+						truck["id"], newW-cur, truck["water"], maxW)
+				} else {
+					fmt.Printf("[Truck %s] Refill failed: %v\n", truck["id"], refillResp["info"])
+				}
+				// Next tick we’ll try extinguish again
+				continue
 			}
+			extReq := Message{
+				"type":       "extinguish",
+				"from":       truck["id"],
+				"x":          curX,
+				"y":          curY,
+				"truckWater": w,
+				"reply":      truck["reply"]}
+
 			truck["mgr"].(chan Message) <- extReq
 			extResp := <-truck["reply"].(chan Message)
 
 			if extResp["ok"].(bool) {
+				spent := extResp["spent"].(int)               // <--
+				truck["water"] = truck["water"].(int) - spent // <--
 				fmt.Printf("[Truck %s] Extinguishing at (%d,%d). Intensity now: %v\n",
 					truck["id"], curX, curY, extResp["intensity"])
 			} else {
@@ -498,7 +556,6 @@ func truckLoop(truck map[string]interface{}) {
 
 // ----------------------- Main -----------------------
 func main() {
-	rand.Seed(time.Now().UnixNano())
 
 	// Create the central manager (with arbitrary example values)
 	manager := createManager(20, 500, 20)
@@ -510,12 +567,12 @@ func main() {
 	go runManager(manager, 50, 2*time.Second, done)
 
 	// Create two initial fires at random grid positions (example)
-	addFire(manager, rand.Intn(20), rand.Intn(20))
-	addFire(manager, rand.Intn(20), rand.Intn(20))
+	addFire(manager, rng.Intn(20), rng.Intn(20))
+	addFire(manager, rng.Intn(20), rng.Intn(20))
 
 	// Create, register, and run 2 firetrucks at random grid positions (example)
-	truck1 := createTruck("T1", rand.Intn(20), rand.Intn(20), manager["inbox"].(chan Message))
-	truck2 := createTruck("T2", rand.Intn(20), rand.Intn(20), manager["inbox"].(chan Message))
+	truck1 := createTruck("T1", rng.Intn(20), rng.Intn(20), manager["inbox"].(chan Message))
+	truck2 := createTruck("T2", rng.Intn(20), rng.Intn(20), manager["inbox"].(chan Message))
 
 	registerTruck(truck1)
 	registerTruck(truck2)

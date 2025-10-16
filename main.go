@@ -297,6 +297,50 @@ func stepToward(sx, sy, tx, ty int) (nx, ny int) {
 }
 
 // ------------------- Manager helper functions -------------------
+func updateCaptainAssignment(truck map[string]interface{}, netLayer *TruckNetwork) {
+	current := netLayer.CurrentCaptain()
+	prev, _ := truck["captain"].(string)
+	if current == prev {
+		return
+	}
+	truck["captain"] = current
+	id := truck["id"].(string)
+	if current == "" {
+		fmt.Printf("[Truck %s] Waiting for captain election\n", id)
+		return
+	}
+	if current == id {
+		fmt.Printf("[Truck %s] Acting as truck captain\n", id)
+	} else {
+		fmt.Printf("[Truck %s] Truck %s elected captain\n", id, current)
+	}
+}
+
+func handlePeerMessage(truck map[string]interface{}, msg Message) {
+	selfID := truck["id"].(string)
+	if msg.From == "" || msg.From == selfID {
+		return
+	}
+	switch msg.Type {
+	case "status_update":
+		pos := "(unknown)"
+		if msg.X != nil && msg.Y != nil {
+			pos = fmt.Sprintf("(%d,%d)", *msg.X, *msg.Y)
+		}
+		water := ""
+		if msg.TruckWater != nil {
+			water = fmt.Sprintf(", water=%d", *msg.TruckWater)
+		}
+		note := msg.Info
+		if note == "" {
+			note = "status"
+		}
+		fmt.Printf("[Truck %s] Peer %s %s%s [%s]\n", selfID, msg.From, pos, water, note)
+	default:
+		fmt.Printf("[Truck %s] Peer message %s from %s\n", selfID, msg.Type, msg.From)
+	}
+}
+
 // TODO for Task 0: add/modify/expand as needed
 
 func inBounds(size, x, y int) bool {
@@ -385,18 +429,29 @@ func display(manager map[string]interface{}) {
 
 // Create a firetruck - note: this creates a local truck but does not register it to the grid
 // Create a firetruck – now it opens a TCP connection to the manager
-func createTruck(id string, x, y int) map[string]interface{} {
+func createTruck(id string, x, y int, listenAddr string, peers map[string]string) map[string]interface{} {
 	tc, err := dialManager(":9000") // TCP client
 	if err != nil {
 		panic(err)
 	}
+	peerCopy := make(map[string]string, len(peers))
+	for pid, addr := range peers {
+		peerCopy[pid] = addr
+	}
+	netLayer, err := newTruckNetwork(id, listenAddr, peerCopy)
+	if err != nil {
+		panic(err)
+	}
 	return map[string]interface{}{
-		"id":       id,
-		"x":        x,
-		"y":        y,
-		"conn":     tc, // <— store TCP handle
-		"water":    5,
-		"maxWater": 10,
+		"id":         id,
+		"x":          x,
+		"y":          y,
+		"conn":       tc,
+		"water":      5,
+		"maxWater":   10,
+		"network":    netLayer,
+		"listenAddr": listenAddr,
+		"captain":    netLayer.CurrentCaptain(),
 	}
 }
 
@@ -418,11 +473,34 @@ func registerTruck(truck map[string]interface{}) {
 // Skeleton of firetruck actions
 func truckLoop(truck map[string]interface{}) {
 	tc := truck["conn"].(*TruckConn)
+	netLayer := truck["network"].(*TruckNetwork)
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
+	drainPeers := func() {
+		for {
+			select {
+			case msg := <-netLayer.Incoming():
+				handlePeerMessage(truck, msg)
+			default:
+				return
+			}
+		}
+	}
+
+	reportStatus := func(note string) {
+		netLayer.PublishStatus(Message{
+			Info:       note,
+			X:          pint(truck["x"].(int)),
+			Y:          pint(truck["y"].(int)),
+			TruckWater: pint(truck["water"].(int)),
+		})
+	}
+
 	for range ticker.C {
-		// 1) Ask nearest fire
+		drainPeers()
+		updateCaptainAssignment(truck, netLayer)
+
 		resp, err := tc.req(Message{
 			Type: "nearest_fire",
 			From: truck["id"].(string),
@@ -431,10 +509,12 @@ func truckLoop(truck map[string]interface{}) {
 		})
 		if err != nil {
 			fmt.Printf("[Truck %s] nearest_fire error: %v\n", truck["id"], err)
+			reportStatus("nearest_fire_error")
 			continue
 		}
 		if resp.OK != nil && !*resp.OK {
 			fmt.Printf("[Truck %s] No fires found.\n", truck["id"])
+			reportStatus("idle")
 			continue
 		}
 
@@ -444,7 +524,6 @@ func truckLoop(truck map[string]interface{}) {
 		curX := truck["x"].(int)
 		curY := truck["y"].(int)
 
-		// 2) If on fire, refill/ extinguish
 		if curX == targetX && curY == targetY {
 			w := truck["water"].(int)
 			if w == 0 {
@@ -458,6 +537,7 @@ func truckLoop(truck map[string]interface{}) {
 				})
 				if err != nil {
 					fmt.Printf("[Truck %s] refill error: %v\n", truck["id"], err)
+					reportStatus("refill_error")
 					continue
 				}
 				if refillResp.OK != nil && *refillResp.OK {
@@ -471,8 +551,10 @@ func truckLoop(truck map[string]interface{}) {
 					truck["water"] = newW
 					fmt.Printf("[Truck %s] Refilled %d units. Tank: %d/%d\n",
 						truck["id"], newW-cur, truck["water"], maxW)
+					reportStatus("refilled")
 				} else {
 					fmt.Printf("[Truck %s] Refill failed: %v\n", truck["id"], refillResp.Info)
+					reportStatus("refill_denied")
 				}
 				continue
 			}
@@ -486,6 +568,7 @@ func truckLoop(truck map[string]interface{}) {
 			})
 			if err != nil {
 				fmt.Printf("[Truck %s] extinguish error: %v\n", truck["id"], err)
+				reportStatus("extinguish_error")
 				continue
 			}
 			if extResp.OK != nil && *extResp.OK {
@@ -493,13 +576,14 @@ func truckLoop(truck map[string]interface{}) {
 				truck["water"] = truck["water"].(int) - spent
 				fmt.Printf("[Truck %s] Extinguishing at (%d,%d). Intensity now: %v\n",
 					truck["id"], curX, curY, *extResp.Intensity)
+				reportStatus("extinguishing")
 			} else {
 				fmt.Printf("[Truck %s] Extinguish failed: %v\n", truck["id"], extResp.Info)
+				reportStatus("extinguish_denied")
 			}
 			continue
 		}
 
-		// 3) Move one step toward target
 		nx, ny := stepToward(curX, curY, targetX, targetY)
 		moveResp, err := tc.req(Message{
 			Type: "move",
@@ -511,14 +595,17 @@ func truckLoop(truck map[string]interface{}) {
 		})
 		if err != nil {
 			fmt.Printf("[Truck %s] move error: %v\n", truck["id"], err)
+			reportStatus("move_error")
 			continue
 		}
 		if moveResp.OK != nil && *moveResp.OK {
 			truck["x"] = *moveResp.X
 			truck["y"] = *moveResp.Y
 			fmt.Printf("[Truck %s] Moved to (%d,%d)\n", truck["id"], truck["x"], truck["y"])
+			reportStatus(fmt.Sprintf("moving_to_%d_%d", targetX, targetY))
 		} else {
 			fmt.Printf("[Truck %s] Move failed: %v\n", truck["id"], moveResp.Info)
+			reportStatus("move_denied")
 		}
 	}
 }
@@ -539,13 +626,23 @@ func main() {
 
 	// ... fires ...
 
-	truck1 := createTruck("T1", rng.Intn(20), rng.Intn(20)) // these call dialManager (with retry)
-	truck2 := createTruck("T2", rng.Intn(20), rng.Intn(20))
+	truckIDs := []string{"T1", "T2"}
+	truckAddrs := make(map[string]string, len(truckIDs))
+	basePort := 9101
+	for i, id := range truckIDs {
+		truckAddrs[id] = fmt.Sprintf("127.0.0.1:%d", basePort+i)
+	}
 
-	registerTruck(truck1)
-	registerTruck(truck2)
-	go truckLoop(truck1)
-	go truckLoop(truck2)
+	var trucks []map[string]interface{}
+	for _, id := range truckIDs {
+		truck := createTruck(id, rng.Intn(20), rng.Intn(20), truckAddrs[id], truckAddrs)
+		registerTruck(truck)
+		trucks = append(trucks, truck)
+	}
+
+	for _, truck := range trucks {
+		go truckLoop(truck)
+	}
 
 	<-done
 

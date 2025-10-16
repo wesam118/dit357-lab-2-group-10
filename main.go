@@ -343,6 +343,27 @@ func handlePeerMessage(truck map[string]interface{}, msg Message) {
 	}
 }
 
+func handleBroadcastMessage(truck map[string]interface{}, msg Message) {
+	if msg.From == "" {
+		return
+	}
+	switch msg.Type {
+	case "assignment":
+		target := msg.Info
+		if target == "" {
+			target = "unknown"
+		}
+		pos := ""
+		if msg.X != nil && msg.Y != nil {
+			pos = fmt.Sprintf(" -> (%d,%d)", *msg.X, *msg.Y)
+		}
+		fmt.Printf("[Truck %s] Captain %s broadcast assignment for %s%s\n",
+			truck["id"], msg.From, target, pos)
+	default:
+		fmt.Printf("[Truck %s] Broadcast %s from %s\n", truck["id"], msg.Type, msg.From)
+	}
+}
+
 // TODO for Task 0: add/modify/expand as needed
 
 func inBounds(size, x, y int) bool {
@@ -474,6 +495,12 @@ func truckLoop(truck map[string]interface{}) {
 		switch msg.Type {
 		case "assignment_proposal":
 			if bus.IsCaptain() {
+				bus.Broadcast(Message{
+					Type: "assignment",
+					Info: msg.From,
+					X:    msg.X,
+					Y:    msg.Y,
+				})
 				return Message{Type: "assignment_ack", OK: pbool(true), Info: "approved"}
 			}
 			return Message{Type: "assignment_ack", OK: pbool(false), Info: "not captain"}
@@ -482,6 +509,7 @@ func truckLoop(truck map[string]interface{}) {
 		}
 	})
 	statusFeed := bus.StatusFeed()
+	broadcastFeed := bus.BroadcastFeed()
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -493,6 +521,11 @@ func truckLoop(truck map[string]interface{}) {
 					return
 				}
 				handlePeerMessage(truck, msg)
+			case bmsg, ok := <-broadcastFeed:
+				if !ok {
+					return
+				}
+				handleBroadcastMessage(truck, bmsg)
 			default:
 				return
 			}

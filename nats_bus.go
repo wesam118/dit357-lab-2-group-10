@@ -10,23 +10,27 @@ import (
 )
 
 const (
-	statusSubject = "trucks.status"
-	peerTTL       = 5 * time.Second
-	requestFormat = "trucks.%s.direct"
+	statusSubject    = "trucks.status"
+	peerTTL          = 5 * time.Second
+	requestFormat    = "trucks.%s.direct"
+	broadcastSubject = "trucks.broadcast"
 )
 
 type TruckBus struct {
-	id     string
-	conn   *nats.Conn
-	allIDs []string
+	id      string
+	conn    *nats.Conn
+	enabled bool
+	allIDs  []string
 
 	mu             sync.RWMutex
 	lastSeen       map[string]time.Time
 	requestHandler func(Message) Message
 
-	statusCh   chan Message
-	statusSub  *nats.Subscription
-	requestSub *nats.Subscription
+	statusCh     chan Message
+	broadcastCh  chan Message
+	statusSub    *nats.Subscription
+	requestSub   *nats.Subscription
+	broadcastSub *nats.Subscription
 }
 
 func newTruckBus(id string, peerIDs []string, url string) (*TruckBus, error) {
@@ -36,8 +40,21 @@ func newTruckBus(id string, peerIDs []string, url string) (*TruckBus, error) {
 		nats.MaxReconnects(-1),
 	}
 	conn, err := nats.Connect(url, opts...)
+	tb := &TruckBus{
+		id:          id,
+		conn:        conn,
+		enabled:     err == nil,
+		allIDs:      make([]string, 0, len(peerIDs)+1),
+		lastSeen:    make(map[string]time.Time),
+		statusCh:    make(chan Message, 32),
+		broadcastCh: make(chan Message, 32),
+	}
+
 	if err != nil {
-		return nil, fmt.Errorf("truck %s failed to connect to NATS: %w", id, err)
+		fmt.Printf("[Truck %s] NATS unavailable (%v); running in local-only mode\n", id, err)
+		tb.allIDs = append(tb.allIDs, id)
+		tb.lastSeen[id] = time.Now()
+		return tb, nil
 	}
 
 	unique := make(map[string]struct{}, len(peerIDs)+1)
@@ -46,18 +63,10 @@ func newTruckBus(id string, peerIDs []string, url string) (*TruckBus, error) {
 	}
 	unique[id] = struct{}{}
 
-	allIDs := make([]string, 0, len(unique))
 	for pid := range unique {
-		allIDs = append(allIDs, pid)
+		tb.allIDs = append(tb.allIDs, pid)
 	}
 
-	tb := &TruckBus{
-		id:       id,
-		conn:     conn,
-		allIDs:   allIDs,
-		lastSeen: make(map[string]time.Time),
-		statusCh: make(chan Message, 32),
-	}
 	tb.lastSeen[id] = time.Now()
 
 	statusSub, err := conn.Subscribe(statusSubject, tb.handleStatus)
@@ -75,6 +84,15 @@ func newTruckBus(id string, peerIDs []string, url string) (*TruckBus, error) {
 		return nil, fmt.Errorf("truck %s failed to subscribe requests: %w", id, err)
 	}
 	tb.requestSub = requestSub
+
+	broadcastSub, err := conn.Subscribe(broadcastSubject, tb.handleBroadcast)
+	if err != nil {
+		requestSub.Unsubscribe()
+		statusSub.Unsubscribe()
+		conn.Close()
+		return nil, fmt.Errorf("truck %s failed to subscribe broadcasts: %w", id, err)
+	}
+	tb.broadcastSub = broadcastSub
 
 	return tb, nil
 }
@@ -110,6 +128,9 @@ func (tb *TruckBus) handleStatus(nm *nats.Msg) {
 }
 
 func (tb *TruckBus) handleRequest(nm *nats.Msg) {
+	if !tb.enabled {
+		return
+	}
 	var msg Message
 	if err := json.Unmarshal(nm.Data, &msg); err != nil {
 		fmt.Printf("[Truck %s] bad request payload: %v\n", tb.id, err)
@@ -139,6 +160,18 @@ func (tb *TruckBus) handleRequest(nm *nats.Msg) {
 	}
 }
 
+func (tb *TruckBus) handleBroadcast(nm *nats.Msg) {
+	var msg Message
+	if err := json.Unmarshal(nm.Data, &msg); err != nil {
+		fmt.Printf("[Truck %s] bad broadcast payload: %v\n", tb.id, err)
+		return
+	}
+	if msg.From == tb.id {
+		return
+	}
+	tb.enqueueBroadcast(msg)
+}
+
 func (tb *TruckBus) enqueueStatus(msg Message) {
 	select {
 	case tb.statusCh <- msg:
@@ -148,6 +181,18 @@ func (tb *TruckBus) enqueueStatus(msg Message) {
 		default:
 		}
 		tb.statusCh <- msg
+	}
+}
+
+func (tb *TruckBus) enqueueBroadcast(msg Message) {
+	select {
+	case tb.broadcastCh <- msg:
+	default:
+		select {
+		case <-tb.broadcastCh:
+		default:
+		}
+		tb.broadcastCh <- msg
 	}
 }
 
@@ -164,6 +209,9 @@ func (tb *TruckBus) SetRequestHandler(handler func(Message) Message) {
 }
 
 func (tb *TruckBus) PublishStatus(msg Message) {
+	if !tb.enabled {
+		return
+	}
 	msg.Type = "status_update"
 	msg.From = tb.id
 	if msg.Corr == "" {
@@ -187,9 +235,17 @@ func (tb *TruckBus) StatusFeed() <-chan Message {
 	return tb.statusCh
 }
 
+func (tb *TruckBus) BroadcastFeed() <-chan Message {
+	return tb.broadcastCh
+}
+
 func (tb *TruckBus) CurrentCaptain() string {
 	tb.mu.RLock()
 	defer tb.mu.RUnlock()
+
+	if !tb.enabled {
+		return tb.id
+	}
 
 	now := time.Now()
 	var chosen string
@@ -228,6 +284,14 @@ func (tb *TruckBus) RequestTo(target string, msg Message, timeout time.Duration)
 	if msg.Corr == "" {
 		msg.Corr = fmt.Sprintf("%s-%d", tb.id, time.Now().UnixNano())
 	}
+	if !tb.enabled {
+		return Message{
+			Type: msg.Type + "_resp",
+			From: tb.id,
+			OK:   pbool(true),
+			Info: "nats disabled",
+		}, nil
+	}
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return Message{}, fmt.Errorf("marshal request: %w", err)
@@ -263,13 +327,44 @@ func (tb *TruckBus) RequestCaptain(msg Message, timeout time.Duration) (Message,
 	return tb.RequestTo(target, msg, timeout)
 }
 
+func (tb *TruckBus) Broadcast(msg Message) {
+	if !tb.enabled {
+		return
+	}
+	msg.From = tb.id
+	if msg.Corr == "" {
+		msg.Corr = fmt.Sprintf("%s-%d", tb.id, time.Now().UnixNano())
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		fmt.Printf("[Truck %s] marshal broadcast error: %v\n", tb.id, err)
+		return
+	}
+	if err := tb.conn.Publish(broadcastSubject, data); err != nil {
+		fmt.Printf("[Truck %s] publish broadcast error: %v\n", tb.id, err)
+	}
+}
+
+func (tb *TruckBus) Enabled() bool {
+	return tb.enabled
+}
+
 func (tb *TruckBus) Close() {
+	if !tb.enabled {
+		close(tb.statusCh)
+		close(tb.broadcastCh)
+		return
+	}
 	if tb.requestSub != nil {
 		tb.requestSub.Unsubscribe()
 	}
 	if tb.statusSub != nil {
 		tb.statusSub.Unsubscribe()
 	}
+	if tb.broadcastSub != nil {
+		tb.broadcastSub.Unsubscribe()
+	}
 	close(tb.statusCh)
+	close(tb.broadcastCh)
 	tb.conn.Drain()
 }

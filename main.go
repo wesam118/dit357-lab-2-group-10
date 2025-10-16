@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math/rand"
 	"time"
+
+	"github.com/nats-io/nats.go"
 )
 
 var rng = rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -297,8 +299,8 @@ func stepToward(sx, sy, tx, ty int) (nx, ny int) {
 }
 
 // ------------------- Manager helper functions -------------------
-func updateCaptainAssignment(truck map[string]interface{}, netLayer *TruckNetwork) {
-	current := netLayer.CurrentCaptain()
+func updateCaptainAssignment(truck map[string]interface{}, bus *TruckBus) {
+	current := bus.CurrentCaptain()
 	prev, _ := truck["captain"].(string)
 	if current == prev {
 		return
@@ -309,7 +311,7 @@ func updateCaptainAssignment(truck map[string]interface{}, netLayer *TruckNetwor
 		fmt.Printf("[Truck %s] Waiting for captain election\n", id)
 		return
 	}
-	if current == id {
+	if bus.IsCaptain() {
 		fmt.Printf("[Truck %s] Acting as truck captain\n", id)
 	} else {
 		fmt.Printf("[Truck %s] Truck %s elected captain\n", id, current)
@@ -428,30 +430,24 @@ func display(manager map[string]interface{}) {
 // Add/modify/expand as needed
 
 // Create a firetruck - note: this creates a local truck but does not register it to the grid
-// Create a firetruck – now it opens a TCP connection to the manager
-func createTruck(id string, x, y int, listenAddr string, peers map[string]string) map[string]interface{} {
+func createTruck(id string, x, y int, peerIDs []string, natsURL string) map[string]interface{} {
 	tc, err := dialManager(":9000") // TCP client
 	if err != nil {
 		panic(err)
 	}
-	peerCopy := make(map[string]string, len(peers))
-	for pid, addr := range peers {
-		peerCopy[pid] = addr
-	}
-	netLayer, err := newTruckNetwork(id, listenAddr, peerCopy)
+	bus, err := newTruckBus(id, peerIDs, natsURL)
 	if err != nil {
 		panic(err)
 	}
 	return map[string]interface{}{
-		"id":         id,
-		"x":          x,
-		"y":          y,
-		"conn":       tc,
-		"water":      5,
-		"maxWater":   10,
-		"network":    netLayer,
-		"listenAddr": listenAddr,
-		"captain":    netLayer.CurrentCaptain(),
+		"id":       id,
+		"x":        x,
+		"y":        y,
+		"conn":     tc,
+		"water":    5,
+		"maxWater": 10,
+		"bus":      bus,
+		"captain":  bus.CurrentCaptain(),
 	}
 }
 
@@ -473,14 +469,29 @@ func registerTruck(truck map[string]interface{}) {
 // Skeleton of firetruck actions
 func truckLoop(truck map[string]interface{}) {
 	tc := truck["conn"].(*TruckConn)
-	netLayer := truck["network"].(*TruckNetwork)
+	bus := truck["bus"].(*TruckBus)
+	bus.SetRequestHandler(func(msg Message) Message {
+		switch msg.Type {
+		case "assignment_proposal":
+			if bus.IsCaptain() {
+				return Message{Type: "assignment_ack", OK: pbool(true), Info: "approved"}
+			}
+			return Message{Type: "assignment_ack", OK: pbool(false), Info: "not captain"}
+		default:
+			return Message{Type: msg.Type + "_resp", OK: pbool(false), Info: "unsupported"}
+		}
+	})
+	statusFeed := bus.StatusFeed()
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	drainPeers := func() {
 		for {
 			select {
-			case msg := <-netLayer.Incoming():
+			case msg, ok := <-statusFeed:
+				if !ok {
+					return
+				}
 				handlePeerMessage(truck, msg)
 			default:
 				return
@@ -489,7 +500,7 @@ func truckLoop(truck map[string]interface{}) {
 	}
 
 	reportStatus := func(note string) {
-		netLayer.PublishStatus(Message{
+		bus.PublishStatus(Message{
 			Info:       note,
 			X:          pint(truck["x"].(int)),
 			Y:          pint(truck["y"].(int)),
@@ -497,9 +508,11 @@ func truckLoop(truck map[string]interface{}) {
 		})
 	}
 
+	reportStatus("online")
+
 	for range ticker.C {
 		drainPeers()
-		updateCaptainAssignment(truck, netLayer)
+		updateCaptainAssignment(truck, bus)
 
 		resp, err := tc.req(Message{
 			Type: "nearest_fire",
@@ -523,6 +536,26 @@ func truckLoop(truck map[string]interface{}) {
 
 		curX := truck["x"].(int)
 		curY := truck["y"].(int)
+
+		if !bus.IsCaptain() {
+			ack, err := bus.RequestCaptain(Message{
+				Type: "assignment_proposal",
+				From: truck["id"].(string),
+				X:    pint(targetX),
+				Y:    pint(targetY),
+			}, 500*time.Millisecond)
+			if err != nil {
+				fmt.Printf("[Truck %s] captain request error: %v\n", truck["id"], err)
+				reportStatus("captain_unreachable")
+				continue
+			}
+			if ack.OK != nil && !*ack.OK {
+				fmt.Printf("[Truck %s] Captain denied assignment: %v\n", truck["id"], ack.Info)
+				reportStatus("captain_denied")
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+		}
 
 		if curX == targetX && curY == targetY {
 			w := truck["water"].(int)
@@ -627,15 +660,10 @@ func main() {
 	// ... fires ...
 
 	truckIDs := []string{"T1", "T2"}
-	truckAddrs := make(map[string]string, len(truckIDs))
-	basePort := 9101
-	for i, id := range truckIDs {
-		truckAddrs[id] = fmt.Sprintf("127.0.0.1:%d", basePort+i)
-	}
-
+	natsURL := nats.DefaultURL
 	var trucks []map[string]interface{}
 	for _, id := range truckIDs {
-		truck := createTruck(id, rng.Intn(20), rng.Intn(20), truckAddrs[id], truckAddrs)
+		truck := createTruck(id, rng.Intn(20), rng.Intn(20), truckIDs, natsURL)
 		registerTruck(truck)
 		trucks = append(trucks, truck)
 	}

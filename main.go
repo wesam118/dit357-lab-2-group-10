@@ -11,6 +11,10 @@ import (
 
 var rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 
+func stampNow() string {
+	return time.Now().Format("15:04:05.000")
+}
+
 type WaterMutexState struct {
 	mu         sync.Mutex
 	cond       *sync.Cond
@@ -41,10 +45,25 @@ func (wm *WaterMutexState) finish() {
 
 func (wm *WaterMutexState) waitForTurn(peerTS int, peerID, selfID string) {
 	wm.mu.Lock()
+	localTS := wm.requestTS
+	deferred := false
 	for wm.requesting && lamportLess(wm.requestTS, selfID, peerTS, peerID) {
+		if !deferred {
+			fmt.Printf("[%s] [Truck %s] Defer water grant to %s (self_ts=%d, peer_ts=%d)\n",
+				stampNow(), selfID, peerID, localTS, peerTS)
+			deferred = true
+		}
 		wm.cond.Wait()
 	}
+	fmt.Printf("[%s] [Truck %s] Grant water to %s (self_ts=%d, peer_ts=%d)\n",
+		stampNow(), selfID, peerID, localTS, peerTS)
 	wm.mu.Unlock()
+}
+
+func (wm *WaterMutexState) timestamp() int {
+	wm.mu.Lock()
+	defer wm.mu.Unlock()
+	return wm.requestTS
 }
 
 func lamportLess(ts1 int, id1 string, ts2 int, id2 string) bool {
@@ -565,9 +584,13 @@ func acquireWaterMutex(truck map[string]interface{}, need int) bool {
 	id := truck["id"].(string)
 	ts := truckClock(truck).Send()
 	wm.start(ts)
+	fmt.Printf("[%s] [Truck %s] Requesting shared water (ts=%d, need=%d)\n",
+		stampNow(), id, ts, need)
 
 	bus, _ := truck["bus"].(*TruckBus)
 	if bus == nil || !bus.Enabled() {
+		fmt.Printf("[%s] [Truck %s] No peers online; water access granted immediately (ts=%d)\n",
+			stampNow(), id, ts)
 		return true
 	}
 	needVal := need
@@ -578,6 +601,8 @@ func acquireWaterMutex(truck map[string]interface{}, need int) bool {
 		if peer == id {
 			continue
 		}
+		fmt.Printf("[%s] [Truck %s] Send water request to %s (req_ts=%d, need=%d)\n",
+			stampNow(), id, peer, ts, needVal)
 		req := Message{
 			Type: "water_request",
 			From: id,
@@ -588,21 +613,30 @@ func acquireWaterMutex(truck map[string]interface{}, need int) bool {
 		req.TS = pint(ts)
 		resp, err := bus.RequestTo(peer, req, 5*time.Second)
 		if err != nil {
-			fmt.Printf("[Truck %s] water mutex request to %s failed: %v\n", id, peer, err)
+			fmt.Printf("[%s] [Truck %s] Water request to %s denied (transport error, ts=%d): %v\n",
+				stampNow(), id, peer, ts, err)
 			wm.finish()
 			return false
 		}
 		if resp.OK != nil && !*resp.OK {
-			fmt.Printf("[Truck %s] water mutex denied by %s: %s\n", id, peer, resp.Info)
+			fmt.Printf("[%s] [Truck %s] Water request to %s denied (ts=%d): %s\n",
+				stampNow(), id, peer, ts, resp.Info)
 			wm.finish()
 			return false
 		}
+		fmt.Printf("[%s] [Truck %s] Water request accepted by %s (req_ts=%d)\n",
+			stampNow(), id, peer, ts)
 	}
 	return true
 }
 
 func releaseWaterMutex(truck map[string]interface{}) {
-	waterMutex(truck).finish()
+	wm := waterMutex(truck)
+	id := truck["id"].(string)
+	prevTS := wm.timestamp()
+	fmt.Printf("[%s] [Truck %s] Releasing shared water (ts=%d)\n",
+		stampNow(), id, prevTS)
+	wm.finish()
 }
 
 // Register a firetruck to the grid via the manager
@@ -640,9 +674,17 @@ func truckLoop(truck map[string]interface{}) {
 			if msg.TS != nil {
 				peerTS = *msg.TS
 			}
+			need := 0
+			if msg.Need != nil {
+				need = *msg.Need
+			}
+			fmt.Printf("[%s] [Truck %s] Incoming water request from %s (peer_ts=%d, need=%d)\n",
+				stampNow(), selfID, msg.From, peerTS, need)
 			if msg.From != "" {
 				waterMutex(truck).waitForTurn(peerTS, msg.From, selfID)
 			}
+			fmt.Printf("[%s] [Truck %s] Accepted water request from %s (peer_ts=%d)\n",
+				stampNow(), selfID, msg.From, peerTS)
 			return Message{Type: "water_reply", OK: pbool(true), Info: "granted"}
 		default:
 			return Message{Type: msg.Type + "_resp", OK: pbool(false), Info: "unsupported"}
@@ -739,7 +781,8 @@ func truckLoop(truck map[string]interface{}) {
 					need = want
 				}
 				if !acquireWaterMutex(truck, need) {
-					fmt.Printf("[Truck %s] Failed to acquire water mutex\n", truck["id"])
+					fmt.Printf("[%s] [Truck %s] Denied water refill (mutex acquisition failed)\n",
+						stampNow(), truck["id"])
 					reportStatus("water_mutex_failed")
 					time.Sleep(200 * time.Millisecond)
 					continue

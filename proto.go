@@ -17,6 +17,7 @@ type Message struct {
 	NX         *int  `json:"nx,omitempty"`
 	NY         *int  `json:"ny,omitempty"`
 	Need       *int  `json:"need,omitempty"`
+	TS         *int  `json:"ts,omitempty"`
 	TruckWater *int  `json:"truckWater,omitempty"`
 	OK         *bool `json:"ok,omitempty"`
 

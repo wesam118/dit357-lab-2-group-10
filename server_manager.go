@@ -46,9 +46,14 @@ func handleConnection(manager map[string]interface{}, conn net.Conn) {
 		// Send reply over TCP
 		select {
 		case resp := <-replyCh:
+			if resp.TS == nil {
+				managerClock(manager).Stamp(&resp)
+			}
 			writeMsg(conn, resp)
 		default:
-			writeMsg(conn, Message{Type: msg.Type + "_ack", OK: pbool(true)})
+			ack := Message{Type: msg.Type + "_ack", OK: pbool(true)}
+			managerClock(manager).Stamp(&ack)
+			writeMsg(conn, ack)
 		}
 	}
 }

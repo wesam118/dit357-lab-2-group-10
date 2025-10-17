@@ -3,12 +3,56 @@ package main
 import (
 	"fmt"
 	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
 )
 
 var rng = rand.New(rand.NewSource(time.Now().UnixNano()))
+
+type WaterMutexState struct {
+	mu         sync.Mutex
+	cond       *sync.Cond
+	requesting bool
+	requestTS  int
+}
+
+func newWaterMutexState() *WaterMutexState {
+	wm := &WaterMutexState{}
+	wm.cond = sync.NewCond(&wm.mu)
+	return wm
+}
+
+func (wm *WaterMutexState) start(ts int) {
+	wm.mu.Lock()
+	wm.requesting = true
+	wm.requestTS = ts
+	wm.mu.Unlock()
+}
+
+func (wm *WaterMutexState) finish() {
+	wm.mu.Lock()
+	wm.requesting = false
+	wm.requestTS = 0
+	wm.cond.Broadcast()
+	wm.mu.Unlock()
+}
+
+func (wm *WaterMutexState) waitForTurn(peerTS int, peerID, selfID string) {
+	wm.mu.Lock()
+	for wm.requesting && lamportLess(wm.requestTS, selfID, peerTS, peerID) {
+		wm.cond.Wait()
+	}
+	wm.mu.Unlock()
+}
+
+func lamportLess(ts1 int, id1 string, ts2 int, id2 string) bool {
+	if ts1 != ts2 {
+		return ts1 < ts2
+	}
+	return id1 < id2
+}
 
 /*
 ================================= Task 0 Template =================================
@@ -473,15 +517,16 @@ func createTruck(id string, x, y int, peerIDs []string, natsURL string) map[stri
 		panic(err)
 	}
 	return map[string]interface{}{
-		"id":       id,
-		"x":        x,
-		"y":        y,
-		"conn":     tc,
-		"water":    5,
-		"maxWater": 10,
-		"bus":      bus,
-		"captain":  bus.CurrentCaptain(),
-		"clock":    clock,
+		"id":         id,
+		"x":          x,
+		"y":          y,
+		"conn":       tc,
+		"water":      5,
+		"maxWater":   10,
+		"bus":        bus,
+		"captain":    bus.CurrentCaptain(),
+		"clock":      clock,
+		"waterMutex": newWaterMutexState(),
 	}
 }
 
@@ -494,6 +539,15 @@ func truckClock(truck map[string]interface{}) *LamportClock {
 	return clk
 }
 
+func waterMutex(truck map[string]interface{}) *WaterMutexState {
+	if wm, ok := truck["waterMutex"].(*WaterMutexState); ok && wm != nil {
+		return wm
+	}
+	wm := newWaterMutexState()
+	truck["waterMutex"] = wm
+	return wm
+}
+
 func managerRequest(truck map[string]interface{}, msg Message) (Message, error) {
 	clk := truckClock(truck)
 	clk.Stamp(&msg)
@@ -504,6 +558,51 @@ func managerRequest(truck map[string]interface{}, msg Message) (Message, error) 
 	}
 	clk.Receive(resp.TS)
 	return resp, nil
+}
+
+func acquireWaterMutex(truck map[string]interface{}, need int) bool {
+	wm := waterMutex(truck)
+	id := truck["id"].(string)
+	ts := truckClock(truck).Send()
+	wm.start(ts)
+
+	bus, _ := truck["bus"].(*TruckBus)
+	if bus == nil || !bus.Enabled() {
+		return true
+	}
+	needVal := need
+	if needVal < 0 {
+		needVal = 0
+	}
+	for _, peer := range bus.PeerIDs() {
+		if peer == id {
+			continue
+		}
+		req := Message{
+			Type: "water_request",
+			From: id,
+		}
+		if needVal > 0 {
+			req.Need = pint(needVal)
+		}
+		req.TS = pint(ts)
+		resp, err := bus.RequestTo(peer, req, 5*time.Second)
+		if err != nil {
+			fmt.Printf("[Truck %s] water mutex request to %s failed: %v\n", id, peer, err)
+			wm.finish()
+			return false
+		}
+		if resp.OK != nil && !*resp.OK {
+			fmt.Printf("[Truck %s] water mutex denied by %s: %s\n", id, peer, resp.Info)
+			wm.finish()
+			return false
+		}
+	}
+	return true
+}
+
+func releaseWaterMutex(truck map[string]interface{}) {
+	waterMutex(truck).finish()
 }
 
 // Register a firetruck to the grid via the manager
@@ -535,6 +634,16 @@ func truckLoop(truck map[string]interface{}) {
 				return Message{Type: "assignment_ack", OK: pbool(true), Info: "approved"}
 			}
 			return Message{Type: "assignment_ack", OK: pbool(false), Info: "not captain"}
+		case "water_request":
+			selfID := truck["id"].(string)
+			peerTS := 0
+			if msg.TS != nil {
+				peerTS = *msg.TS
+			}
+			if msg.From != "" {
+				waterMutex(truck).waitForTurn(peerTS, msg.From, selfID)
+			}
+			return Message{Type: "water_reply", OK: pbool(true), Info: "granted"}
 		default:
 			return Message{Type: msg.Type + "_resp", OK: pbool(false), Info: "unsupported"}
 		}
@@ -625,13 +734,24 @@ func truckLoop(truck map[string]interface{}) {
 			w := truck["water"].(int)
 			if w == 0 {
 				want := truck["maxWater"].(int)
+				need := want - w
+				if need <= 0 {
+					need = want
+				}
+				if !acquireWaterMutex(truck, need) {
+					fmt.Printf("[Truck %s] Failed to acquire water mutex\n", truck["id"])
+					reportStatus("water_mutex_failed")
+					time.Sleep(200 * time.Millisecond)
+					continue
+				}
 				refillResp, err := managerRequest(truck, Message{
 					Type: "refill_truck",
 					From: truck["id"].(string),
 					X:    pint(curX),
 					Y:    pint(curY),
-					Need: pint(want - w),
+					Need: pint(need),
 				})
+				releaseWaterMutex(truck)
 				if err != nil {
 					fmt.Printf("[Truck %s] refill error: %v\n", truck["id"], err)
 					reportStatus("refill_error")

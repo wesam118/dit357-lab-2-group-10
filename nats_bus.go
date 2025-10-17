@@ -68,7 +68,6 @@ func newTruckBus(id string, peerIDs []string, url string, clock *LamportClock) (
 	}
 
 	if err != nil {
-		fmt.Printf("[Truck %s] NATS unavailable (%v); running in local-only mode\n", id, err)
 		tb.allIDs = append(tb.allIDs, id)
 		tb.lastSeen[id] = time.Now()
 		return tb, nil

@@ -238,7 +238,11 @@ func (tb *TruckBus) PublishStatus(msg Message) {
 	if msg.Corr == "" {
 		msg.Corr = fmt.Sprintf("%s-%d", tb.id, time.Now().UnixNano())
 	}
-	tb.stamp(&msg)
+	if msg.TS == nil {
+		tb.stamp(&msg)
+	} else if tb.clock != nil {
+		tb.clock.Observe(msg.TS)
+	}
 	data, err := json.Marshal(msg)
 	if err != nil {
 		fmt.Printf("[Truck %s] marshal status error: %v\n", tb.id, err)
@@ -296,6 +300,14 @@ func (tb *TruckBus) IsCaptain() bool {
 	return tb.CurrentCaptain() == tb.id
 }
 
+func (tb *TruckBus) PeerIDs() []string {
+	tb.mu.RLock()
+	defer tb.mu.RUnlock()
+	ids := make([]string, len(tb.allIDs))
+	copy(ids, tb.allIDs)
+	return ids
+}
+
 func (tb *TruckBus) RequestTo(target string, msg Message, timeout time.Duration) (Message, error) {
 	if target == "" {
 		return Message{}, fmt.Errorf("no target provided")
@@ -306,7 +318,11 @@ func (tb *TruckBus) RequestTo(target string, msg Message, timeout time.Duration)
 	if msg.Corr == "" {
 		msg.Corr = fmt.Sprintf("%s-%d", tb.id, time.Now().UnixNano())
 	}
-	tb.stamp(&msg)
+	if msg.TS == nil {
+		tb.stamp(&msg)
+	} else if tb.clock != nil {
+		tb.clock.Observe(msg.TS)
+	}
 	if !tb.enabled {
 		resp := Message{
 			Type: msg.Type + "_resp",
@@ -365,7 +381,11 @@ func (tb *TruckBus) Broadcast(msg Message) {
 	if msg.Corr == "" {
 		msg.Corr = fmt.Sprintf("%s-%d", tb.id, time.Now().UnixNano())
 	}
-	tb.stamp(&msg)
+	if msg.TS == nil {
+		tb.stamp(&msg)
+	} else if tb.clock != nil {
+		tb.clock.Observe(msg.TS)
+	}
 	data, err := json.Marshal(msg)
 	if err != nil {
 		fmt.Printf("[Truck %s] marshal broadcast error: %v\n", tb.id, err)

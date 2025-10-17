@@ -976,12 +976,12 @@ func truckLoop(truck map[string]interface{}) {
 // ----------------------- Main -----------------------
 func main() {
 	manager := createManager(20, 500, 1)
-	go runManagerTCP(manager) // start TCP server
-	done := make(chan struct{})
-	go runManager(manager, 50, 2*time.Second, done) // tick/spread/display
 
-	// ... fires ...
+	// Start TCP server and wait for it to be ready
+	go runManagerTCP(manager)
+	time.Sleep(500 * time.Millisecond) // Give TCP server time to start listening
 
+	// Create and register trucks BEFORE starting the manager loop
 	truckIDs := []string{"T1", "T2"}
 	natsURL := nats.DefaultURL
 	var trucks []map[string]interface{}
@@ -991,10 +991,14 @@ func main() {
 		trucks = append(trucks, truck)
 	}
 
+	// Start truck loops before the manager loop
 	for _, truck := range trucks {
 		go truckLoop(truck)
 	}
 
-	<-done
+	// Now start the manager loop after everything else is ready
+	done := make(chan struct{})
+	go runManager(manager, 50, 2*time.Second, done)
 
+	<-done
 }

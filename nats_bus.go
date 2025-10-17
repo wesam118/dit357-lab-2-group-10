@@ -20,6 +20,7 @@ type TruckBus struct {
 	id      string
 	conn    *nats.Conn
 	enabled bool
+	clock   *LamportClock
 	allIDs  []string
 
 	mu             sync.RWMutex
@@ -33,7 +34,22 @@ type TruckBus struct {
 	broadcastSub *nats.Subscription
 }
 
-func newTruckBus(id string, peerIDs []string, url string) (*TruckBus, error) {
+func (tb *TruckBus) stamp(msg *Message) {
+	if tb.clock != nil {
+		tb.clock.Stamp(msg)
+	}
+}
+
+func (tb *TruckBus) receive(ts *int) {
+	if tb.clock != nil {
+		tb.clock.Receive(ts)
+	}
+}
+
+func newTruckBus(id string, peerIDs []string, url string, clock *LamportClock) (*TruckBus, error) {
+	if clock == nil {
+		clock = NewLamportClock()
+	}
 	opts := []nats.Option{
 		nats.Name("truck-" + id),
 		nats.ReconnectWait(500 * time.Millisecond),
@@ -44,6 +60,7 @@ func newTruckBus(id string, peerIDs []string, url string) (*TruckBus, error) {
 		id:          id,
 		conn:        conn,
 		enabled:     err == nil,
+		clock:       clock,
 		allIDs:      make([]string, 0, len(peerIDs)+1),
 		lastSeen:    make(map[string]time.Time),
 		statusCh:    make(chan Message, 32),
@@ -103,6 +120,7 @@ func (tb *TruckBus) handleStatus(nm *nats.Msg) {
 		fmt.Printf("[Truck %s] bad status payload: %v\n", tb.id, err)
 		return
 	}
+	tb.receive(msg.TS)
 	if msg.From == "" {
 		return
 	}
@@ -136,6 +154,7 @@ func (tb *TruckBus) handleRequest(nm *nats.Msg) {
 		fmt.Printf("[Truck %s] bad request payload: %v\n", tb.id, err)
 		return
 	}
+	tb.receive(msg.TS)
 
 	handler := tb.getRequestHandler()
 	var resp Message
@@ -150,6 +169,7 @@ func (tb *TruckBus) handleRequest(nm *nats.Msg) {
 	if nm.Reply == "" {
 		return
 	}
+	tb.stamp(&resp)
 	data, err := json.Marshal(resp)
 	if err != nil {
 		fmt.Printf("[Truck %s] marshal reply error: %v\n", tb.id, err)
@@ -166,6 +186,7 @@ func (tb *TruckBus) handleBroadcast(nm *nats.Msg) {
 		fmt.Printf("[Truck %s] bad broadcast payload: %v\n", tb.id, err)
 		return
 	}
+	tb.receive(msg.TS)
 	if msg.From == tb.id {
 		return
 	}
@@ -217,6 +238,7 @@ func (tb *TruckBus) PublishStatus(msg Message) {
 	if msg.Corr == "" {
 		msg.Corr = fmt.Sprintf("%s-%d", tb.id, time.Now().UnixNano())
 	}
+	tb.stamp(&msg)
 	data, err := json.Marshal(msg)
 	if err != nil {
 		fmt.Printf("[Truck %s] marshal status error: %v\n", tb.id, err)
@@ -284,28 +306,35 @@ func (tb *TruckBus) RequestTo(target string, msg Message, timeout time.Duration)
 	if msg.Corr == "" {
 		msg.Corr = fmt.Sprintf("%s-%d", tb.id, time.Now().UnixNano())
 	}
+	tb.stamp(&msg)
 	if !tb.enabled {
-		return Message{
+		resp := Message{
 			Type: msg.Type + "_resp",
 			From: tb.id,
 			OK:   pbool(true),
 			Info: "nats disabled",
-		}, nil
-	}
-	data, err := json.Marshal(msg)
-	if err != nil {
-		return Message{}, fmt.Errorf("marshal request: %w", err)
+		}
+		tb.stamp(&resp)
+		tb.receive(resp.TS)
+		return resp, nil
 	}
 	if target == tb.id {
 		handler := tb.getRequestHandler()
 		if handler == nil {
 			return Message{}, fmt.Errorf("no handler on self")
 		}
+		tb.receive(msg.TS)
 		resp := handler(msg)
 		if resp.From == "" {
 			resp.From = tb.id
 		}
+		tb.stamp(&resp)
+		tb.receive(resp.TS)
 		return resp, nil
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return Message{}, fmt.Errorf("marshal request: %w", err)
 	}
 	subject := fmt.Sprintf(requestFormat, target)
 	reply, err := tb.conn.Request(subject, data, timeout)
@@ -316,6 +345,7 @@ func (tb *TruckBus) RequestTo(target string, msg Message, timeout time.Duration)
 	if err := json.Unmarshal(reply.Data, &resp); err != nil {
 		return Message{}, fmt.Errorf("decode response: %w", err)
 	}
+	tb.receive(resp.TS)
 	return resp, nil
 }
 
@@ -335,6 +365,7 @@ func (tb *TruckBus) Broadcast(msg Message) {
 	if msg.Corr == "" {
 		msg.Corr = fmt.Sprintf("%s-%d", tb.id, time.Now().UnixNano())
 	}
+	tb.stamp(&msg)
 	data, err := json.Marshal(msg)
 	if err != nil {
 		fmt.Printf("[Truck %s] marshal broadcast error: %v\n", tb.id, err)

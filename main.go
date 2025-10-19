@@ -15,6 +15,7 @@ var rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 const (
 	truckNamePrefix = "truck"
 	fireNamePrefix  = "fire"
+	managerTCPAddr  = "127.0.0.1:9000"
 )
 
 func flatTruckName(id string) string {
@@ -679,7 +680,7 @@ func createTruck(id string, x, y int, peerIDs []string, natsURL string) map[stri
 		flatPeers[i] = flatTruckName(pid)
 	}
 
-	tc, err := dialManager(":9000") // TCP client
+	tc, err := dialManager(managerTCPAddr) // TCP client
 	if err != nil {
 		panic(err)
 	}
@@ -975,6 +976,11 @@ func acquireWaterMutex(truck map[string]interface{}, need int) bool {
 		if peer == id {
 			continue
 		}
+		if !bus.SeenRecently(peer, peerTTL) {
+			fmt.Printf("[%s] [Truck %s] Skip water request to %s (peer offline)\n",
+				stampNow(), id, peer)
+			continue
+		}
 		fmt.Printf("[%s] [Truck %s] Send water request to %s (req_ts=%d, need=%d)\n",
 			stampNow(), id, peer, ts, needVal)
 		req := Message{
@@ -989,8 +995,8 @@ func acquireWaterMutex(truck map[string]interface{}, need int) bool {
 		if err != nil {
 			fmt.Printf("[%s] [Truck %s] Water request to %s denied (transport error, ts=%d): %v\n",
 				stampNow(), id, peer, ts, err)
-			wm.finish()
-			return false
+			bus.MarkOffline(peer)
+			continue
 		}
 		if resp.OK != nil && !*resp.OK {
 			fmt.Printf("[%s] [Truck %s] Water request to %s denied (ts=%d): %s\n",
@@ -1093,9 +1099,11 @@ func truckLoop(truck map[string]interface{}) {
 	}
 
 	reportStatus("online")
+	updateCaptainAssignment(truck, bus)
 
 	for range ticker.C {
 		drainPeers()
+		updateCaptainAssignment(truck, bus)
 		pruneStaleFires(truck)
 
 		selfID := truck["id"].(string)

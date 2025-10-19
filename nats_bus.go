@@ -307,6 +307,28 @@ func (tb *TruckBus) PeerIDs() []string {
 	return ids
 }
 
+func (tb *TruckBus) SeenRecently(id string, ttl time.Duration) bool {
+	tb.mu.RLock()
+	defer tb.mu.RUnlock()
+	if id == tb.id {
+		return true
+	}
+	last, ok := tb.lastSeen[id]
+	if !ok || last.IsZero() {
+		return false
+	}
+	return time.Since(last) <= ttl
+}
+
+func (tb *TruckBus) MarkOffline(id string) {
+	if id == "" || id == tb.id {
+		return
+	}
+	tb.mu.Lock()
+	tb.lastSeen[id] = time.Time{}
+	tb.mu.Unlock()
+}
+
 func (tb *TruckBus) RequestTo(target string, msg Message, timeout time.Duration) (Message, error) {
 	if target == "" {
 		return Message{}, fmt.Errorf("no target provided")

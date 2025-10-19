@@ -8,11 +8,11 @@ import (
 
 // Run the manager as a TCP server
 func runManagerTCP(manager map[string]interface{}) {
-	listener, err := net.Listen("tcp", "127.0.0.1:9000")
+	listener, err := net.Listen("tcp", managerTCPAddr)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println("[Manager] Listening on 127.0.0.1:9000")
+	fmt.Printf("[Manager] Listening on %s\n", managerTCPAddr)
 
 	for {
 		conn, err := listener.Accept()

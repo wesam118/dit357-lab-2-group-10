@@ -96,6 +96,27 @@ func lamportLess(ts1 int, id1 string, ts2 int, id2 string) bool {
 	return id1 < id2
 }
 
+type FireState struct {
+	X         int
+	Y         int
+	Intensity int
+
+	LastSeen time.Time
+
+	ClaimedBy string
+	ClaimCost int
+	ClaimTS   int
+	ClaimedAt time.Time
+
+	MyCost int
+}
+
+const (
+	fireInfoTTL   = 10 * time.Second
+	fireClaimTTL  = 20 * time.Second
+	fireScanDelay = 3 * time.Second
+)
+
 /*
 ================================= Task 0 Template =================================
 This is a very basic, minimal template that aims to provide a starting point for
@@ -140,14 +161,15 @@ func createManager(size int, waterCapacity int, refillRate int) map[string]inter
 		"refill": refillRate,
 		"inbox":  make(chan Message, 100), // This is where the messages from the trucks are sent to. It can hold up to 100 messages
 		"clock":  NewLamportClock(),
+		"locker": &sync.RWMutex{},
 	}
 }
 
 // Run the central manager, which is responsible for what's happening on the grid
 func runManager(manager map[string]interface{}, stopAfter int, tick time.Duration, done chan struct{}) {
 	inbox := manager["inbox"].(chan Message)
-	grid := manager["grid"].([][]map[string]interface{})
-	size := len(grid)
+	size := len(manager["grid"].([][]map[string]interface{}))
+	mu := managerMutex(manager)
 
 	timestep := 0
 	ticker := time.NewTicker(tick)
@@ -155,25 +177,20 @@ func runManager(manager map[string]interface{}, stopAfter int, tick time.Duratio
 
 	for {
 		timestep++
-		// Handle messages from trucks
+		mu.Lock()
 		drainMessages(manager)
 
-		// Spread fires every 2 timesteps
 		if timestep%2 == 0 {
 			spreadFires(manager)
 		}
-
-		// Random new fire
 		if rng.Float32() < 0.5 {
 			addFire(manager, rng.Intn(size), rng.Intn(size))
 		}
-
-		// Refill global water supply so that it doesn't just run out
 		refillWater(manager)
 
-		// Display grid
 		fmt.Printf("\n--- TIMESTEP %d ---\n", timestep)
 		display(manager)
+		mu.Unlock()
 
 		// Wait until next tick
 		waitUntil := time.Now().Add(tick)
@@ -201,7 +218,7 @@ func drainMessages(manager map[string]interface{}) {
 	for {
 		select {
 		case msg := <-inbox:
-			handleMessage(manager, msg)
+			handleMessageLocked(manager, msg)
 		default:
 			return
 		}
@@ -217,6 +234,15 @@ func managerClock(manager map[string]interface{}) *LamportClock {
 	return clk
 }
 
+func managerMutex(manager map[string]interface{}) *sync.RWMutex {
+	if mu, ok := manager["locker"].(*sync.RWMutex); ok && mu != nil {
+		return mu
+	}
+	mu := &sync.RWMutex{}
+	manager["locker"] = mu
+	return mu
+}
+
 func sendManagerReply(manager map[string]interface{}, reply chan Message, resp Message) {
 	if reply == nil {
 		return
@@ -226,6 +252,13 @@ func sendManagerReply(manager map[string]interface{}, reply chan Message, resp M
 }
 
 func handleMessage(manager map[string]interface{}, msg Message) {
+	mu := managerMutex(manager)
+	mu.Lock()
+	defer mu.Unlock()
+	handleMessageLocked(manager, msg)
+}
+
+func handleMessageLocked(manager map[string]interface{}, msg Message) {
 	managerClock(manager).Receive(msg.TS)
 
 	grid := manager["grid"].([][]map[string]interface{})
@@ -479,26 +512,76 @@ func handleBroadcastMessage(truck map[string]interface{}, msg Message) {
 	if msg.From == "" {
 		return
 	}
+	selfID := truck["id"].(string)
+	fireID := msg.Resource
+	if fireID == "" && msg.X != nil && msg.Y != nil {
+		fireID = flatFireName(*msg.X, *msg.Y)
+	}
 	switch msg.Type {
-	case "assignment":
-		target := msg.Resource
-		if target == "" {
-			target = msg.Info
+	case "fire_spotted":
+		if msg.X == nil || msg.Y == nil || msg.From == selfID {
+			return
 		}
-		if target == "" && msg.X != nil && msg.Y != nil {
-			target = flatFireName(*msg.X, *msg.Y)
+		intensity := -1
+		if msg.Intensity != nil {
+			intensity = *msg.Intensity
 		}
-		if target == "" {
-			target = "unknown"
+		fs, fresh := observeFire(truck, fireID, *msg.X, *msg.Y, intensity)
+		if fresh {
+			fmt.Printf("[Truck %s] Fire spotted by %s at %s (%d,%d)\n",
+				selfID, msg.From, fireID, fs.X, fs.Y)
 		}
-		pos := ""
+	case "fire_claim":
+		if fireID == "" || msg.From == selfID {
+			return
+		}
 		if msg.X != nil && msg.Y != nil {
-			pos = fmt.Sprintf(" -> (%d,%d)", *msg.X, *msg.Y)
+			observeFire(truck, fireID, *msg.X, *msg.Y, -1)
 		}
-		fmt.Printf("[Truck %s] Captain %s broadcast assignment for %s%s\n",
-			truck["id"], msg.From, target, pos)
+		cost := 0
+		if msg.Need != nil {
+			cost = *msg.Need
+		}
+		fs := ensureFireState(truck, fireID)
+		if fs.ClaimedBy == msg.From {
+			if msg.TS != nil {
+				fs.ClaimTS = *msg.TS
+			}
+			if cost > 0 {
+				fs.ClaimCost = cost
+			}
+			fs.ClaimedAt = time.Now()
+			return
+		}
+		curTarget := currentTarget(truck)
+		if claimBeats(fs.ClaimCost, fs.ClaimedBy, cost, msg.From) {
+			adoptClaim(fs, msg.From, cost, msg.TS)
+			if curTarget == fireID && fs.ClaimedBy != selfID {
+				setCurrentTarget(truck, "")
+				forceRescan(truck)
+				fmt.Printf("[Truck %s] Yielded fire %s to %s (cost=%d)\n",
+					selfID, fireID, msg.From, cost)
+				// Trigger immediate rescan to redirect to another unclaimed fire
+				truck["needsRescan"] = true
+			} else {
+				fmt.Printf("[Truck %s] Fire %s claimed by %s (cost=%d)\n",
+					selfID, fireID, msg.From, cost)
+			}
+		}
+	case "fire_release":
+		if fireID == "" || msg.From == "" {
+			return
+		}
+		if fs, ok := fireRegistry(truck)[fireID]; ok {
+			releaseClaim(fs)
+		}
+		if currentTarget(truck) == fireID {
+			setCurrentTarget(truck, "")
+			forceRescan(truck)
+		}
+		fmt.Printf("[Truck %s] Fire %s released by %s\n", selfID, fireID, msg.From)
 	default:
-		fmt.Printf("[Truck %s] Broadcast %s from %s\n", truck["id"], msg.Type, msg.From)
+		fmt.Printf("[Truck %s] Broadcast %s from %s\n", selfID, msg.Type, msg.From)
 	}
 }
 
@@ -606,17 +689,21 @@ func createTruck(id string, x, y int, peerIDs []string, natsURL string) map[stri
 		panic(err)
 	}
 	return map[string]interface{}{
-		"id":         flatID,
-		"rawID":      id,
-		"x":          x,
-		"y":          y,
-		"conn":       tc,
-		"water":      5,
-		"maxWater":   10,
-		"bus":        bus,
-		"captain":    bus.CurrentCaptain(),
-		"clock":      clock,
-		"waterMutex": newWaterMutexState(),
+		"id":          flatID,
+		"rawID":       id,
+		"x":           x,
+		"y":           y,
+		"conn":        tc,
+		"water":       5,
+		"maxWater":    10,
+		"bus":         bus,
+		"captain":     bus.CurrentCaptain(),
+		"clock":       clock,
+		"waterMutex":  newWaterMutexState(),
+		"fires":       make(map[string]*FireState),
+		"target":      "",
+		"nextScan":    time.Now(),
+		"needsRescan": false,
 	}
 }
 
@@ -636,6 +723,222 @@ func waterMutex(truck map[string]interface{}) *WaterMutexState {
 	wm := newWaterMutexState()
 	truck["waterMutex"] = wm
 	return wm
+}
+
+func fireRegistry(truck map[string]interface{}) map[string]*FireState {
+	if fires, ok := truck["fires"].(map[string]*FireState); ok && fires != nil {
+		return fires
+	}
+	fires := make(map[string]*FireState)
+	truck["fires"] = fires
+	return fires
+}
+
+func ensureFireState(truck map[string]interface{}, fireID string) *FireState {
+	fires := fireRegistry(truck)
+	if fs, ok := fires[fireID]; ok && fs != nil {
+		return fs
+	}
+	fs := &FireState{}
+	fires[fireID] = fs
+	return fs
+}
+
+func getFireState(truck map[string]interface{}, fireID string) (*FireState, bool) {
+	fs := ensureFireState(truck, fireID)
+	if fs.X == 0 && fs.Y == 0 && fs.LastSeen.IsZero() {
+		return fs, false
+	}
+	return fs, true
+}
+
+func currentTarget(truck map[string]interface{}) string {
+	if tgt, ok := truck["target"].(string); ok {
+		return tgt
+	}
+	return ""
+}
+
+func setCurrentTarget(truck map[string]interface{}, fireID string) {
+	truck["target"] = fireID
+}
+
+func resetCurrentTarget(truck map[string]interface{}, fireID string) {
+	if fireID == "" {
+		return
+	}
+	if tgt := currentTarget(truck); tgt == fireID {
+		truck["target"] = ""
+	}
+}
+
+func nextScanDue(truck map[string]interface{}) time.Time {
+	if ts, ok := truck["nextScan"].(time.Time); ok {
+		return ts
+	}
+	return time.Time{}
+}
+
+func scheduleNextScan(truck map[string]interface{}, delay time.Duration) {
+	truck["nextScan"] = time.Now().Add(delay)
+}
+
+func forceRescan(truck map[string]interface{}) {
+	truck["nextScan"] = time.Now()
+}
+
+func observeFire(truck map[string]interface{}, fireID string, x, y int, intensity int) (*FireState, bool) {
+	fs := ensureFireState(truck, fireID)
+	prevSeen := fs.LastSeen
+	fs.X = x
+	fs.Y = y
+	if intensity >= 0 {
+		fs.Intensity = intensity
+	}
+	fs.LastSeen = time.Now()
+	fresh := prevSeen.IsZero() || time.Since(prevSeen) > 500*time.Millisecond
+	return fs, fresh
+}
+
+func manhattanDistance(x1, y1, x2, y2 int) int {
+	dx := x1 - x2
+	if dx < 0 {
+		dx = -dx
+	}
+	dy := y1 - y2
+	if dy < 0 {
+		dy = -dy
+	}
+	return dx + dy
+}
+
+func computeFireCost(truck map[string]interface{}, fs *FireState) int {
+	curX := truck["x"].(int)
+	curY := truck["y"].(int)
+	cost := manhattanDistance(curX, curY, fs.X, fs.Y)
+	if water, ok := truck["water"].(int); ok && water == 0 {
+		cost += 5
+	}
+	return cost
+}
+
+func claimBeats(existingCost int, existingID string, incomingCost int, incomingID string) bool {
+	if existingID == "" {
+		return true
+	}
+	if incomingCost != existingCost {
+		return incomingCost < existingCost
+	}
+	return incomingID < existingID
+}
+
+func adoptClaim(fs *FireState, claimant string, cost int, ts *int) {
+	fs.ClaimedBy = claimant
+	fs.ClaimCost = cost
+	fs.ClaimedAt = time.Now()
+	if ts != nil {
+		fs.ClaimTS = *ts
+	}
+}
+
+func releaseClaim(fs *FireState) {
+	fs.ClaimedBy = ""
+	fs.ClaimCost = 0
+	fs.ClaimTS = 0
+	fs.ClaimedAt = time.Time{}
+}
+
+func pruneStaleFires(truck map[string]interface{}) {
+	selfID := truck["id"].(string)
+	fires := fireRegistry(truck)
+	for id, fs := range fires {
+		if !fs.ClaimedAt.IsZero() && time.Since(fs.ClaimedAt) > fireClaimTTL {
+			if fs.ClaimedBy == selfID {
+				broadcastFireRelease(truck, id, fs.X, fs.Y)
+			}
+			releaseClaim(fs)
+		}
+		if time.Since(fs.LastSeen) > fireInfoTTL {
+			delete(fires, id)
+		}
+	}
+}
+
+func broadcastFireSpot(truck map[string]interface{}, fs *FireState) {
+	bus, _ := truck["bus"].(*TruckBus)
+	if bus == nil || !bus.Enabled() {
+		return
+	}
+	msg := Message{
+		Type:     "fire_spotted",
+		From:     truck["id"].(string),
+		Resource: flatFireName(fs.X, fs.Y),
+		X:        pint(fs.X),
+		Y:        pint(fs.Y),
+	}
+	if fs.Intensity > 0 {
+		msg.Intensity = pint(fs.Intensity)
+	}
+	bus.Broadcast(msg)
+}
+
+func pickBestFire(truck map[string]interface{}) (string, *FireState, int) {
+	selfID := truck["id"].(string)
+	fires := fireRegistry(truck)
+	bestID := ""
+	var bestFS *FireState
+	bestCost := int(^uint(0) >> 1)
+	for id, fs := range fires {
+		if time.Since(fs.LastSeen) > fireInfoTTL {
+			continue
+		}
+		if fs.ClaimedBy != "" && fs.ClaimedBy != selfID {
+			if !fs.ClaimedAt.IsZero() && time.Since(fs.ClaimedAt) <= fireClaimTTL {
+				continue
+			}
+		}
+		cost := computeFireCost(truck, fs)
+		fs.MyCost = cost
+		if bestFS == nil || cost < bestCost || (cost == bestCost && id < bestID) {
+			bestID = id
+			bestFS = fs
+			bestCost = cost
+		}
+	}
+	return bestID, bestFS, bestCost
+}
+
+func broadcastFireClaim(truck map[string]interface{}, fs *FireState, cost int) {
+	bus, _ := truck["bus"].(*TruckBus)
+	if bus == nil || !bus.Enabled() {
+		return
+	}
+	msg := Message{
+		Type:     "fire_claim",
+		From:     truck["id"].(string),
+		Resource: flatFireName(fs.X, fs.Y),
+		X:        pint(fs.X),
+		Y:        pint(fs.Y),
+		Need:     pint(cost),
+	}
+	if fs.Intensity > 0 {
+		msg.Intensity = pint(fs.Intensity)
+	}
+	bus.Broadcast(msg)
+}
+
+func broadcastFireRelease(truck map[string]interface{}, fireID string, x, y int) {
+	bus, _ := truck["bus"].(*TruckBus)
+	if bus == nil || !bus.Enabled() {
+		return
+	}
+	bus.Broadcast(Message{
+		Type:     "fire_release",
+		From:     truck["id"].(string),
+		Resource: fireID,
+		X:        pint(x),
+		Y:        pint(y),
+	})
 }
 
 func managerRequest(truck map[string]interface{}, msg Message) (Message, error) {
@@ -729,23 +1032,6 @@ func truckLoop(truck map[string]interface{}) {
 	bus := truck["bus"].(*TruckBus)
 	bus.SetRequestHandler(func(msg Message) Message {
 		switch msg.Type {
-		case "assignment_proposal":
-			assigned := flatTruckName(msg.From)
-			targetResource := msg.Resource
-			if targetResource == "" && msg.X != nil && msg.Y != nil {
-				targetResource = flatFireName(*msg.X, *msg.Y)
-			}
-			if bus.IsCaptain() {
-				bus.Broadcast(Message{
-					Type:     "assignment",
-					Info:     assigned,
-					X:        msg.X,
-					Y:        msg.Y,
-					Resource: targetResource,
-				})
-				return Message{Type: "assignment_ack", OK: pbool(true), Info: "approved", Resource: targetResource}
-			}
-			return Message{Type: "assignment_ack", OK: pbool(false), Info: "not captain", Resource: targetResource}
 		case "water_request":
 			selfID := truck["id"].(string)
 			peerTS := 0
@@ -793,12 +1079,16 @@ func truckLoop(truck map[string]interface{}) {
 	}
 
 	reportStatus := func(note string) {
+		resource := truck["id"].(string)
+		if tgt := currentTarget(truck); tgt != "" {
+			resource = tgt
+		}
 		bus.PublishStatus(Message{
 			Info:       note,
 			X:          pint(truck["x"].(int)),
 			Y:          pint(truck["y"].(int)),
 			TruckWater: pint(truck["water"].(int)),
-			Resource:   truck["id"].(string),
+			Resource:   resource,
 		})
 	}
 
@@ -806,54 +1096,118 @@ func truckLoop(truck map[string]interface{}) {
 
 	for range ticker.C {
 		drainPeers()
-		updateCaptainAssignment(truck, bus)
+		pruneStaleFires(truck)
 
-		resp, err := managerRequest(truck, Message{
-			Type: "nearest_fire",
-			From: truck["id"].(string),
-			X:    pint(truck["x"].(int)),
-			Y:    pint(truck["y"].(int)),
-		})
-		if err != nil {
-			fmt.Printf("[Truck %s] nearest_fire error: %v\n", truck["id"], err)
-			reportStatus("nearest_fire_error")
+		selfID := truck["id"].(string)
+
+		if time.Now().After(nextScanDue(truck)) {
+			scheduleNextScan(truck, fireScanDelay)
+			resp, err := managerRequest(truck, Message{
+				Type: "nearest_fire",
+				From: selfID,
+				X:    pint(truck["x"].(int)),
+				Y:    pint(truck["y"].(int)),
+			})
+			if err != nil {
+				fmt.Printf("[Truck %s] nearest_fire error: %v\n", selfID, err)
+			} else if resp.OK != nil && *resp.OK {
+				targetX := *resp.X
+				targetY := *resp.Y
+				fireID := flatFireName(targetX, targetY)
+				fs, fresh := observeFire(truck, fireID, targetX, targetY, -1)
+				if fresh {
+					broadcastFireSpot(truck, fs)
+				}
+			}
+		}
+
+		// Check if we need to redirect to another fire
+		if needsRescan, ok := truck["needsRescan"].(bool); ok && needsRescan {
+			truck["needsRescan"] = false
+			newID, fs, cost := pickBestFire(truck)
+			if newID != "" {
+				setCurrentTarget(truck, newID)
+				adoptClaim(fs, selfID, cost, nil)
+				broadcastFireClaim(truck, fs, cost)
+				fmt.Printf("[Truck %s] Redirecting to fire %s (cost=%d)\n", selfID, newID, cost)
+				reportStatus("redirecting")
+				continue
+			} else {
+				fmt.Printf("[Truck %s] No alternative fire found, going idle\n", selfID)
+				reportStatus("idle")
+				continue
+			}
+		}
+
+		targetID := currentTarget(truck)
+		fires := fireRegistry(truck)
+		target := fires[targetID]
+		if targetID != "" {
+			if target == nil {
+				setCurrentTarget(truck, "")
+				forceRescan(truck)
+				targetID = ""
+			} else if time.Since(target.LastSeen) > fireInfoTTL {
+				if target.ClaimedBy == selfID {
+					broadcastFireRelease(truck, targetID, target.X, target.Y)
+					releaseClaim(target)
+				}
+				delete(fires, targetID)
+				setCurrentTarget(truck, "")
+				forceRescan(truck)
+				target = nil
+				targetID = ""
+			}
+		}
+
+		justClaimed := false
+
+		if target == nil {
+			newID, fs, cost := pickBestFire(truck)
+			if newID != "" {
+				targetID = newID
+				target = fs
+				setCurrentTarget(truck, targetID)
+				adoptClaim(target, selfID, cost, nil)
+				broadcastFireClaim(truck, target, cost)
+				fmt.Printf("[Truck %s] Claiming fire %s (cost=%d)\n", selfID, targetID, cost)
+				reportStatus("claiming")
+				justClaimed = true
+			}
+		} else if target.ClaimedBy == "" || target.ClaimedBy == selfID {
+			cost := computeFireCost(truck, target)
+			target.MyCost = cost
+			if time.Since(target.ClaimedAt) > 2*time.Second {
+				adoptClaim(target, selfID, cost, nil)
+				broadcastFireClaim(truck, target, cost)
+			}
+		} else if target.ClaimedBy != selfID {
+			setCurrentTarget(truck, "")
+			target = nil
+			targetID = ""
+		}
+
+		if justClaimed {
 			continue
 		}
-		if resp.OK != nil && !*resp.OK {
-			fmt.Printf("[Truck %s] No fires found.\n", truck["id"])
+
+		if target == nil {
 			reportStatus("idle")
 			continue
 		}
 
-		targetX := *resp.X
-		targetY := *resp.Y
-		targetName := resp.Resource
-		if targetName == "" {
-			targetName = flatFireName(targetX, targetY)
-		}
-
 		curX := truck["x"].(int)
 		curY := truck["y"].(int)
+		targetX := target.X
+		targetY := target.Y
+		targetName := targetID
 
-		if !bus.IsCaptain() {
-			ack, err := bus.RequestCaptain(Message{
-				Type:     "assignment_proposal",
-				From:     truck["id"].(string),
-				X:        pint(targetX),
-				Y:        pint(targetY),
-				Resource: targetName,
-			}, 500*time.Millisecond)
-			if err != nil {
-				fmt.Printf("[Truck %s] captain request error: %v\n", truck["id"], err)
-				reportStatus("captain_unreachable")
-				continue
-			}
-			if ack.OK != nil && !*ack.OK {
-				fmt.Printf("[Truck %s] Captain denied assignment for %s: %v\n", truck["id"], targetName, ack.Info)
-				reportStatus("captain_denied")
-				time.Sleep(500 * time.Millisecond)
-				continue
-			}
+		if target.ClaimedBy != selfID {
+			fmt.Printf("[Truck %s] Yielding fire %s to %s\n", selfID, targetName, target.ClaimedBy)
+			setCurrentTarget(truck, "")
+			forceRescan(truck)
+			reportStatus("yielded_claim")
+			continue
 		}
 
 		if curX == targetX && curY == targetY {
@@ -866,14 +1220,14 @@ func truckLoop(truck map[string]interface{}) {
 				}
 				if !acquireWaterMutex(truck, need) {
 					fmt.Printf("[%s] [Truck %s] Denied water refill (mutex acquisition failed)\n",
-						stampNow(), truck["id"])
+						stampNow(), selfID)
 					reportStatus("water_mutex_failed")
 					time.Sleep(200 * time.Millisecond)
 					continue
 				}
 				refillResp, err := managerRequest(truck, Message{
 					Type:     "refill_truck",
-					From:     truck["id"].(string),
+					From:     selfID,
 					X:        pint(curX),
 					Y:        pint(curY),
 					Need:     pint(need),
@@ -881,7 +1235,7 @@ func truckLoop(truck map[string]interface{}) {
 				})
 				releaseWaterMutex(truck)
 				if err != nil {
-					fmt.Printf("[Truck %s] refill error at %s: %v\n", truck["id"], targetName, err)
+					fmt.Printf("[Truck %s] refill error at %s: %v\n", selfID, targetName, err)
 					reportStatus("refill_error")
 					continue
 				}
@@ -895,10 +1249,10 @@ func truckLoop(truck map[string]interface{}) {
 					}
 					truck["water"] = newW
 					fmt.Printf("[Truck %s] Refilled %d units at %s. Tank: %d/%d\n",
-						truck["id"], newW-cur, targetName, truck["water"], maxW)
+						selfID, newW-cur, targetName, truck["water"], maxW)
 					reportStatus("refilled")
 				} else {
-					fmt.Printf("[Truck %s] Refill failed at %s: %v\n", truck["id"], targetName, refillResp.Info)
+					fmt.Printf("[Truck %s] Refill failed at %s: %v\n", selfID, targetName, refillResp.Info)
 					reportStatus("refill_denied")
 				}
 				continue
@@ -906,25 +1260,36 @@ func truckLoop(truck map[string]interface{}) {
 
 			extResp, err := managerRequest(truck, Message{
 				Type:       "extinguish",
-				From:       truck["id"].(string),
+				From:       selfID,
 				X:          pint(curX),
 				Y:          pint(curY),
 				TruckWater: pint(w),
 				Resource:   targetName,
 			})
 			if err != nil {
-				fmt.Printf("[Truck %s] extinguish error at %s: %v\n", truck["id"], targetName, err)
+				fmt.Printf("[Truck %s] extinguish error at %s: %v\n", selfID, targetName, err)
 				reportStatus("extinguish_error")
 				continue
 			}
 			if extResp.OK != nil && *extResp.OK {
 				spent := *extResp.Spent
 				truck["water"] = truck["water"].(int) - spent
-				fmt.Printf("[Truck %s] Extinguishing %s at (%d,%d). Intensity now: %v\n",
-					truck["id"], targetName, curX, curY, *extResp.Intensity)
+				intensityStr := "unknown"
+				if extResp.Intensity != nil {
+					target.Intensity = *extResp.Intensity
+					intensityStr = fmt.Sprintf("%d", *extResp.Intensity)
+				}
+				fmt.Printf("[Truck %s] Extinguishing %s at (%d,%d). Intensity now: %s\n",
+					selfID, targetName, curX, curY, intensityStr)
 				reportStatus("extinguishing")
+				if extResp.Intensity != nil && *extResp.Intensity == 0 {
+					broadcastFireRelease(truck, targetName, targetX, targetY)
+					releaseClaim(target)
+					setCurrentTarget(truck, "")
+					delete(fires, targetName)
+				}
 			} else {
-				fmt.Printf("[Truck %s] Extinguish failed at %s: %v\n", truck["id"], targetName, extResp.Info)
+				fmt.Printf("[Truck %s] Extinguish failed at %s: %v\n", selfID, targetName, extResp.Info)
 				reportStatus("extinguish_denied")
 			}
 			continue
@@ -934,7 +1299,7 @@ func truckLoop(truck map[string]interface{}) {
 		stepName := flatFireName(nx, ny)
 		moveResp, err := managerRequest(truck, Message{
 			Type:     "move",
-			From:     truck["id"].(string),
+			From:     selfID,
 			X:        pint(curX),
 			Y:        pint(curY),
 			NX:       pint(nx),
@@ -942,7 +1307,7 @@ func truckLoop(truck map[string]interface{}) {
 			Resource: stepName,
 		})
 		if err != nil {
-			fmt.Printf("[Truck %s] move error toward %s: %v\n", truck["id"], stepName, err)
+			fmt.Printf("[Truck %s] move error toward %s: %v\n", selfID, stepName, err)
 			reportStatus("move_error")
 			continue
 		}
@@ -953,14 +1318,14 @@ func truckLoop(truck map[string]interface{}) {
 			if destName == "" {
 				destName = stepName
 			}
-			fmt.Printf("[Truck %s] Moved to %s (%d,%d)\n", truck["id"], destName, truck["x"], truck["y"])
+			fmt.Printf("[Truck %s] Moved to %s (%d,%d)\n", selfID, destName, truck["x"], truck["y"])
 			reportStatus(fmt.Sprintf("moving_to_%s", targetName))
 		} else {
 			destName := moveResp.Resource
 			if destName == "" {
 				destName = stepName
 			}
-			fmt.Printf("[Truck %s] Move failed toward %s: %v\n", truck["id"], destName, moveResp.Info)
+			fmt.Printf("[Truck %s] Move failed toward %s: %v\n", selfID, destName, moveResp.Info)
 			reportStatus("move_denied")
 		}
 	}

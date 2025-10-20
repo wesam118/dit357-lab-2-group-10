@@ -22,6 +22,7 @@ type Message struct {
 	OK         *bool `json:"ok,omitempty"`
 
 	Info      string `json:"info,omitempty"`
+	Resource  string `json:"resource,omitempty"`
 	Intensity *int   `json:"intensity,omitempty"`
 	Granted   *int   `json:"granted,omitempty"`
 	Spent     *int   `json:"spent,omitempty"`

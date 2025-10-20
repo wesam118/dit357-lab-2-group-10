@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
@@ -10,6 +11,28 @@ import (
 )
 
 var rng = rand.New(rand.NewSource(time.Now().UnixNano()))
+
+const (
+	truckNamePrefix = "truck"
+	fireNamePrefix  = "fire"
+)
+
+func flatTruckName(id string) string {
+	trimmed := strings.TrimSpace(id)
+	if trimmed == "" {
+		return truckNamePrefix
+	}
+	lower := strings.ToLower(trimmed)
+	prefix := truckNamePrefix + "-"
+	if strings.HasPrefix(lower, prefix) {
+		return lower
+	}
+	return prefix + lower
+}
+
+func flatFireName(x, y int) string {
+	return fmt.Sprintf("%s-%d-%d", fireNamePrefix, x, y)
+}
 
 func stampNow() string {
 	return time.Now().Format("15:04:05.000")
@@ -106,6 +129,7 @@ func createManager(size int, waterCapacity int, refillRate int) map[string]inter
 				"fire":      false,
 				"intensity": 0,
 				"truck":     "",
+				"location":  flatFireName(i, j),
 			}
 		}
 	}
@@ -211,7 +235,7 @@ func handleMessage(manager map[string]interface{}, msg Message) {
 
 	case "register":
 		x, y := *msg.X, *msg.Y
-		id := msg.From
+		id := flatTruckName(msg.From)
 
 		if !inBounds(size, x, y) {
 			sendManagerReply(manager, msg.Reply, Message{OK: pbool(false), Info: "out of bounds"})
@@ -223,21 +247,29 @@ func handleMessage(manager map[string]interface{}, msg Message) {
 		}
 
 		grid[x][y]["truck"] = id
-		sendManagerReply(manager, msg.Reply, Message{OK: pbool(true), Info: "registered"})
+		sendManagerReply(manager, msg.Reply, Message{OK: pbool(true), Info: "registered", Resource: id})
 		return
 
 	case "nearest_fire":
 		sx, sy := *msg.X, *msg.Y
 		nx, ny, ok := nearestFireFrom(grid, sx, sy)
 		if ok {
-			sendManagerReply(manager, msg.Reply, Message{Type: "nearest_fire", OK: pbool(true), X: pint(nx), Y: pint(ny), Info: "nearest_fire"})
+			loc := grid[nx][ny]["location"].(string)
+			sendManagerReply(manager, msg.Reply, Message{
+				Type:     "nearest_fire",
+				OK:       pbool(true),
+				X:        pint(nx),
+				Y:        pint(ny),
+				Info:     loc,
+				Resource: loc,
+			})
 		} else {
 			sendManagerReply(manager, msg.Reply, Message{Type: "nearest_fire", OK: pbool(false), Info: "no fire"})
 		}
 		return
 
 	case "move":
-		id := msg.From
+		id := flatTruckName(msg.From)
 		sx, sy := *msg.X, *msg.Y
 		nx, ny := *msg.NX, *msg.NY
 
@@ -256,11 +288,18 @@ func handleMessage(manager map[string]interface{}, msg Message) {
 
 		grid[sx][sy]["truck"] = ""
 		grid[nx][ny]["truck"] = id
-		sendManagerReply(manager, msg.Reply, Message{OK: pbool(true), X: pint(nx), Y: pint(ny), Info: "moved"})
+		location := grid[nx][ny]["location"].(string)
+		sendManagerReply(manager, msg.Reply, Message{
+			OK:       pbool(true),
+			X:        pint(nx),
+			Y:        pint(ny),
+			Info:     "moved",
+			Resource: location,
+		})
 		return
 
 	case "extinguish":
-		id := msg.From
+		id := flatTruckName(msg.From)
 		x, y := *msg.X, *msg.Y
 		truckWater := *msg.TruckWater
 
@@ -292,11 +331,17 @@ func handleMessage(manager map[string]interface{}, msg Message) {
 		}
 		grid[x][y]["intensity"] = intensity
 
-		sendManagerReply(manager, msg.Reply, Message{OK: pbool(true), Spent: pint(remove), Intensity: pint(intensity)})
+		location := grid[x][y]["location"].(string)
+		sendManagerReply(manager, msg.Reply, Message{
+			OK:        pbool(true),
+			Spent:     pint(remove),
+			Intensity: pint(intensity),
+			Resource:  location,
+		})
 		return
 
 	case "refill_truck":
-		id := msg.From
+		id := flatTruckName(msg.From)
 		x, y := *msg.X, *msg.Y
 		need := *msg.Need
 
@@ -315,7 +360,12 @@ func handleMessage(manager map[string]interface{}, msg Message) {
 		}
 		manager["water"] = avail - need
 
-		sendManagerReply(manager, msg.Reply, Message{OK: pbool(true), Granted: pint(need)})
+		location := grid[x][y]["location"].(string)
+		sendManagerReply(manager, msg.Reply, Message{
+			OK:       pbool(true),
+			Granted:  pint(need),
+			Resource: location,
+		})
 		return
 
 	default:
@@ -410,7 +460,15 @@ func handlePeerMessage(truck map[string]interface{}, msg Message) {
 		if note == "" {
 			note = "status"
 		}
-		fmt.Printf("[Truck %s] Peer %s %s%s [%s]\n", selfID, msg.From, pos, water, note)
+		resource := msg.Resource
+		if resource == "" && msg.X != nil && msg.Y != nil {
+			resource = flatFireName(*msg.X, *msg.Y)
+		}
+		resSuffix := ""
+		if resource != "" {
+			resSuffix = fmt.Sprintf(" {%s}", resource)
+		}
+		fmt.Printf("[Truck %s] Peer %s %s%s [%s]%s\n", selfID, msg.From, pos, water, note, resSuffix)
 	default:
 		fmt.Printf("[Truck %s] Peer message %s from %s\n", selfID, msg.Type, msg.From)
 	}
@@ -423,7 +481,13 @@ func handleBroadcastMessage(truck map[string]interface{}, msg Message) {
 	}
 	switch msg.Type {
 	case "assignment":
-		target := msg.Info
+		target := msg.Resource
+		if target == "" {
+			target = msg.Info
+		}
+		if target == "" && msg.X != nil && msg.Y != nil {
+			target = flatFireName(*msg.X, *msg.Y)
+		}
 		if target == "" {
 			target = "unknown"
 		}
@@ -526,17 +590,24 @@ func display(manager map[string]interface{}) {
 
 // Create a firetruck - note: this creates a local truck but does not register it to the grid
 func createTruck(id string, x, y int, peerIDs []string, natsURL string) map[string]interface{} {
+	flatID := flatTruckName(id)
+	flatPeers := make([]string, len(peerIDs))
+	for i, pid := range peerIDs {
+		flatPeers[i] = flatTruckName(pid)
+	}
+
 	tc, err := dialManager(":9000") // TCP client
 	if err != nil {
 		panic(err)
 	}
 	clock := NewLamportClock()
-	bus, err := newTruckBus(id, peerIDs, natsURL, clock)
+	bus, err := newTruckBus(flatID, flatPeers, natsURL, clock)
 	if err != nil {
 		panic(err)
 	}
 	return map[string]interface{}{
-		"id":         id,
+		"id":         flatID,
+		"rawID":      id,
 		"x":          x,
 		"y":          y,
 		"conn":       tc,
@@ -642,10 +713,11 @@ func releaseWaterMutex(truck map[string]interface{}) {
 // Register a firetruck to the grid via the manager
 func registerTruck(truck map[string]interface{}) {
 	_, err := managerRequest(truck, Message{
-		Type: "register",
-		From: truck["id"].(string),
-		X:    pint(truck["x"].(int)),
-		Y:    pint(truck["y"].(int)),
+		Type:     "register",
+		From:     truck["id"].(string),
+		X:        pint(truck["x"].(int)),
+		Y:        pint(truck["y"].(int)),
+		Resource: truck["id"].(string),
 	})
 	if err != nil {
 		panic(err)
@@ -658,16 +730,22 @@ func truckLoop(truck map[string]interface{}) {
 	bus.SetRequestHandler(func(msg Message) Message {
 		switch msg.Type {
 		case "assignment_proposal":
+			assigned := flatTruckName(msg.From)
+			targetResource := msg.Resource
+			if targetResource == "" && msg.X != nil && msg.Y != nil {
+				targetResource = flatFireName(*msg.X, *msg.Y)
+			}
 			if bus.IsCaptain() {
 				bus.Broadcast(Message{
-					Type: "assignment",
-					Info: msg.From,
-					X:    msg.X,
-					Y:    msg.Y,
+					Type:     "assignment",
+					Info:     assigned,
+					X:        msg.X,
+					Y:        msg.Y,
+					Resource: targetResource,
 				})
-				return Message{Type: "assignment_ack", OK: pbool(true), Info: "approved"}
+				return Message{Type: "assignment_ack", OK: pbool(true), Info: "approved", Resource: targetResource}
 			}
-			return Message{Type: "assignment_ack", OK: pbool(false), Info: "not captain"}
+			return Message{Type: "assignment_ack", OK: pbool(false), Info: "not captain", Resource: targetResource}
 		case "water_request":
 			selfID := truck["id"].(string)
 			peerTS := 0
@@ -720,6 +798,7 @@ func truckLoop(truck map[string]interface{}) {
 			X:          pint(truck["x"].(int)),
 			Y:          pint(truck["y"].(int)),
 			TruckWater: pint(truck["water"].(int)),
+			Resource:   truck["id"].(string),
 		})
 	}
 
@@ -748,16 +827,21 @@ func truckLoop(truck map[string]interface{}) {
 
 		targetX := *resp.X
 		targetY := *resp.Y
+		targetName := resp.Resource
+		if targetName == "" {
+			targetName = flatFireName(targetX, targetY)
+		}
 
 		curX := truck["x"].(int)
 		curY := truck["y"].(int)
 
 		if !bus.IsCaptain() {
 			ack, err := bus.RequestCaptain(Message{
-				Type: "assignment_proposal",
-				From: truck["id"].(string),
-				X:    pint(targetX),
-				Y:    pint(targetY),
+				Type:     "assignment_proposal",
+				From:     truck["id"].(string),
+				X:        pint(targetX),
+				Y:        pint(targetY),
+				Resource: targetName,
 			}, 500*time.Millisecond)
 			if err != nil {
 				fmt.Printf("[Truck %s] captain request error: %v\n", truck["id"], err)
@@ -765,7 +849,7 @@ func truckLoop(truck map[string]interface{}) {
 				continue
 			}
 			if ack.OK != nil && !*ack.OK {
-				fmt.Printf("[Truck %s] Captain denied assignment: %v\n", truck["id"], ack.Info)
+				fmt.Printf("[Truck %s] Captain denied assignment for %s: %v\n", truck["id"], targetName, ack.Info)
 				reportStatus("captain_denied")
 				time.Sleep(500 * time.Millisecond)
 				continue
@@ -788,15 +872,16 @@ func truckLoop(truck map[string]interface{}) {
 					continue
 				}
 				refillResp, err := managerRequest(truck, Message{
-					Type: "refill_truck",
-					From: truck["id"].(string),
-					X:    pint(curX),
-					Y:    pint(curY),
-					Need: pint(need),
+					Type:     "refill_truck",
+					From:     truck["id"].(string),
+					X:        pint(curX),
+					Y:        pint(curY),
+					Need:     pint(need),
+					Resource: targetName,
 				})
 				releaseWaterMutex(truck)
 				if err != nil {
-					fmt.Printf("[Truck %s] refill error: %v\n", truck["id"], err)
+					fmt.Printf("[Truck %s] refill error at %s: %v\n", truck["id"], targetName, err)
 					reportStatus("refill_error")
 					continue
 				}
@@ -809,11 +894,11 @@ func truckLoop(truck map[string]interface{}) {
 						newW = maxW
 					}
 					truck["water"] = newW
-					fmt.Printf("[Truck %s] Refilled %d units. Tank: %d/%d\n",
-						truck["id"], newW-cur, truck["water"], maxW)
+					fmt.Printf("[Truck %s] Refilled %d units at %s. Tank: %d/%d\n",
+						truck["id"], newW-cur, targetName, truck["water"], maxW)
 					reportStatus("refilled")
 				} else {
-					fmt.Printf("[Truck %s] Refill failed: %v\n", truck["id"], refillResp.Info)
+					fmt.Printf("[Truck %s] Refill failed at %s: %v\n", truck["id"], targetName, refillResp.Info)
 					reportStatus("refill_denied")
 				}
 				continue
@@ -825,46 +910,57 @@ func truckLoop(truck map[string]interface{}) {
 				X:          pint(curX),
 				Y:          pint(curY),
 				TruckWater: pint(w),
+				Resource:   targetName,
 			})
 			if err != nil {
-				fmt.Printf("[Truck %s] extinguish error: %v\n", truck["id"], err)
+				fmt.Printf("[Truck %s] extinguish error at %s: %v\n", truck["id"], targetName, err)
 				reportStatus("extinguish_error")
 				continue
 			}
 			if extResp.OK != nil && *extResp.OK {
 				spent := *extResp.Spent
 				truck["water"] = truck["water"].(int) - spent
-				fmt.Printf("[Truck %s] Extinguishing at (%d,%d). Intensity now: %v\n",
-					truck["id"], curX, curY, *extResp.Intensity)
+				fmt.Printf("[Truck %s] Extinguishing %s at (%d,%d). Intensity now: %v\n",
+					truck["id"], targetName, curX, curY, *extResp.Intensity)
 				reportStatus("extinguishing")
 			} else {
-				fmt.Printf("[Truck %s] Extinguish failed: %v\n", truck["id"], extResp.Info)
+				fmt.Printf("[Truck %s] Extinguish failed at %s: %v\n", truck["id"], targetName, extResp.Info)
 				reportStatus("extinguish_denied")
 			}
 			continue
 		}
 
 		nx, ny := stepToward(curX, curY, targetX, targetY)
+		stepName := flatFireName(nx, ny)
 		moveResp, err := managerRequest(truck, Message{
-			Type: "move",
-			From: truck["id"].(string),
-			X:    pint(curX),
-			Y:    pint(curY),
-			NX:   pint(nx),
-			NY:   pint(ny),
+			Type:     "move",
+			From:     truck["id"].(string),
+			X:        pint(curX),
+			Y:        pint(curY),
+			NX:       pint(nx),
+			NY:       pint(ny),
+			Resource: stepName,
 		})
 		if err != nil {
-			fmt.Printf("[Truck %s] move error: %v\n", truck["id"], err)
+			fmt.Printf("[Truck %s] move error toward %s: %v\n", truck["id"], stepName, err)
 			reportStatus("move_error")
 			continue
 		}
 		if moveResp.OK != nil && *moveResp.OK {
 			truck["x"] = *moveResp.X
 			truck["y"] = *moveResp.Y
-			fmt.Printf("[Truck %s] Moved to (%d,%d)\n", truck["id"], truck["x"], truck["y"])
-			reportStatus(fmt.Sprintf("moving_to_%d_%d", targetX, targetY))
+			destName := moveResp.Resource
+			if destName == "" {
+				destName = stepName
+			}
+			fmt.Printf("[Truck %s] Moved to %s (%d,%d)\n", truck["id"], destName, truck["x"], truck["y"])
+			reportStatus(fmt.Sprintf("moving_to_%s", targetName))
 		} else {
-			fmt.Printf("[Truck %s] Move failed: %v\n", truck["id"], moveResp.Info)
+			destName := moveResp.Resource
+			if destName == "" {
+				destName = stepName
+			}
+			fmt.Printf("[Truck %s] Move failed toward %s: %v\n", truck["id"], destName, moveResp.Info)
 			reportStatus("move_denied")
 		}
 	}
@@ -880,12 +976,12 @@ func truckLoop(truck map[string]interface{}) {
 // ----------------------- Main -----------------------
 func main() {
 	manager := createManager(20, 500, 1)
-	go runManagerTCP(manager) // start TCP server
-	done := make(chan struct{})
-	go runManager(manager, 50, 2*time.Second, done) // tick/spread/display
 
-	// ... fires ...
+	// Start TCP server and wait for it to be ready
+	go runManagerTCP(manager)
+	time.Sleep(500 * time.Millisecond) // Give TCP server time to start listening
 
+	// Create and register trucks BEFORE starting the manager loop
 	truckIDs := []string{"T1", "T2"}
 	natsURL := nats.DefaultURL
 	var trucks []map[string]interface{}
@@ -895,10 +991,14 @@ func main() {
 		trucks = append(trucks, truck)
 	}
 
+	// Start truck loops before the manager loop
 	for _, truck := range trucks {
 		go truckLoop(truck)
 	}
 
-	<-done
+	// Now start the manager loop after everything else is ready
+	done := make(chan struct{})
+	go runManager(manager, 50, 2*time.Second, done)
 
+	<-done
 }
